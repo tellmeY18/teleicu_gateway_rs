@@ -83,7 +83,7 @@ serde_json     = "1"
 sqlx           = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "uuid", "chrono"] }
 
 # HTTP client
-reqwest        = { version = "0.11", features = ["json", "rustls-tls", "stream"], default-features = false }
+reqwest        = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 
 # JWT — inbound validation
 jsonwebtoken   = "9"
@@ -91,9 +91,6 @@ jsonwebtoken   = "9"
 # RSA keypair — outbound signing + JWKS exposure
 rsa            = { version = "0.9", features = ["pem", "sha2"] }
 pkcs8          = { version = "0.10", features = ["alloc", "pem"] }
-
-# JOSE / JWK serialization for /openid-configuration
-p256           = "0.13"   # if EC keys needed later
 
 # XML — ONVIF SOAP
 quick-xml      = { version = "0.31", features = ["serialize"] }
@@ -108,7 +105,6 @@ rand           = "0.8"
 
 # Config
 dotenvy        = "0.15"
-config         = "0.14"
 
 # Time, IDs, logging
 uuid           = { version = "1", features = ["v4", "serde"] }
@@ -127,12 +123,17 @@ aws-sdk-s3     = "1"
 anyhow         = "1"
 thiserror      = "1"
 
+# Async trait (required by axum-core 0.4.x's FromRequestParts)
+async-trait    = "0.1"
+
 # Concurrent map for camera locks and observation store
 dashmap        = "5"
 
-# Async trait
-async-trait    = "0.1"
+# Sentry
+sentry         = { version = "0.34", features = ["tracing"] }
 ```
+
+> **Dep drift note**: The Cargo.toml in this doc is a reference snapshot. Always treat the real `Cargo.toml` as source of truth — check it before adding or changing dependencies. Notable past corrections: `reqwest` is 0.12 (not 0.11), `p256` and `config` crates were never actually used and have been removed.
 
 ---
 
@@ -145,7 +146,7 @@ pub struct Settings {
     pub bind_host: String,                   // default "0.0.0.0"
     pub bind_port: u16,                      // default 8090
 
-    pub database_url: String,                // "sqlite:./gateway.db"
+    pub database_url: String,                // "sqlite:./gateway.db?mode=rwc"
 
     pub care_api: String,                    // "https://care.10bedicu.in"
     pub care_api_timeout_secs: u64,          // default 25
@@ -174,7 +175,8 @@ pub struct Settings {
     pub state_dir: String,                   // default "./data" — persisted keypair etc.
 
     pub sentry_dsn: Option<String>,
-    pub app_version: String,                 // default "unknown"
+    pub app_version: String,                 // default env!("CARGO_PKG_VERSION")
+    pub encryption_key: Option<String>,      // AES key for encrypting asset credentials at rest
 }
 ```
 
@@ -833,3 +835,507 @@ For `/stream` specifically: pipe response body bytes as a stream without bufferi
 **Sentry**: Add `sentry` crate integration. Initialize in `main.rs` if `SENTRY_DSN` is set. Capture panics and `AppError::Internal` variants. Use `sentry::integrations::tracing` layer.
 
 **OpenAPI docs**: Add `utoipa` + `utoipa-swagger-ui` to expose `GET /api/docs/` and `GET /api/schema/`. Annotate all handlers. Equivalent to `drf-spectacular` in the original.
+
+---
+
+## Startup Sequence (`main.rs`)
+
+The binary is zero-config-friendly — it creates missing directories and the SQLite file on first run. The boot sequence is:
+
+1. Load `.env` via `dotenvy` (logs whether a file was found and from where).
+2. Init `tracing-subscriber` with `RUST_LOG` env filter (default `info,teleicu_gateway=debug`).
+3. Load `Settings::from_env()`.
+4. Log a full config summary: cwd, `DATABASE_URL`, `STATE_DIR`, `CARE_API`, `RTSPTOWEB_URL`, `GATEWAY_DEVICE_ID` presence, S3/Sentry/JWKS status, automated-obs settings.
+5. **Pre-flight checks**: ensure the database parent directory and `STATE_DIR` exist, creating them with `create_dir_all` if needed. Errors here include the resolved path and cwd for debuggability.
+6. Init Sentry (if `SENTRY_DSN` set).
+7. Connect to SQLite via `SqlitePoolOptions`. The default URL uses `?mode=rwc` so the file is created if absent. The error message on failure includes the URL and cwd.
+8. Run `sqlx::migrate!("./migrations")`.
+9. `OwnKeypair::load_or_generate` — tries `JWKS_BASE64` env → `{STATE_DIR}/jwks.json` file → generate new RSA-2048, persists to file.
+10. Build `AppState`, spawn background tasks, bind and serve.
+
+When debugging startup failures: check the cwd (the binary logs it), whether `DATABASE_URL` includes `?mode=rwc`, and whether `STATE_DIR` is writable.
+
+---
+
+## Build & Run
+
+**Cargo** (requires SQLite and, on macOS, libiconv via Nix dev shell or Xcode CLI tools):
+```
+cargo build --release          # binary at target/release/teleicu-gateway
+```
+
+**Nix** (hermetic, handles all native deps):
+```
+nix develop                    # enter dev shell with all deps
+nix build                      # production binary at result/bin/teleicu-gateway
+```
+
+On macOS, always use `nix develop` for building — the project depends on `libiconv` and `sqlite` which the flake's dev shell provides. Running `cargo build` outside the shell will fail with linker errors.
+
+**Running**: copy `.env.example` to `.env`, fill in `GATEWAY_DEVICE_ID`, and run the binary. Everything else has working defaults.
+
+---
+
+## Axum Extractor Caveat
+
+`axum-core` 0.4.x defines `FromRequestParts` with the `#[async_trait]` macro (from the `async-trait` crate), not native Rust async-in-trait. Any `impl FromRequestParts` **must** also carry the `#[async_trait]` attribute and import `use async_trait::async_trait`. Writing a bare `async fn from_request_parts` without the attribute produces a confusing `E0195` lifetime mismatch error. This applies to `CareAuth` in `src/auth/inbound.rs` and any future custom extractors.
+
+---
+
+# Plans
+
+## Plan 1: Testing Framework — Unit Tests + End-to-End Tests
+
+### Goal
+
+Make the binary bulletproof by building a comprehensive test suite that covers every module's happy path, error paths, and edge cases. Tests must be runnable with `cargo test` (no external services required for unit tests) and with a single command for E2E tests.
+
+### Dev Dependencies to Add (`Cargo.toml [dev-dependencies]`)
+
+```toml
+[dev-dependencies]
+tokio-test      = "0.4"
+axum-test       = "15"          # or tower::ServiceExt-based testing
+tempfile        = "3"           # temp dirs for SQLite, STATE_DIR, keypair files
+wiremock        = "0.6"         # mock HTTP server for CARE API + ONVIF cameras
+pretty_assertions = "1"         # better diff output on assertion failures
+```
+
+No test binary or custom harness needed — standard `#[cfg(test)] mod tests` in each file plus `tests/` directory for integration/E2E tests.
+
+### Test Helper Module (`src/test_helpers.rs` — `#[cfg(test)]` gated)
+
+A shared test utility module providing:
+
+- **`test_settings()`** — returns a `Settings` with safe defaults: bind to `127.0.0.1:0`, `database_url = "sqlite::memory:"`, empty `gateway_device_id`, S3 disabled, Sentry disabled, `state_dir` pointing to a `tempfile::TempDir`, random `encryption_key`.
+- **`test_app_state()`** — builds a full `AppState` backed by an in-memory SQLite DB with migrations applied, a freshly-generated `OwnKeypair`, a real `reqwest::Client`, and empty `ObservationStore` / `CameraLockMap`. Returns `(AppState, TempDir)` so the tempdir lives long enough.
+- **`test_router(state: AppState)`** — returns the full `Router<AppState>` with all routes wired (extracted from `main.rs` into a standalone `fn build_router(state, rtsptoweb_url) -> Router` to make it testable).
+- **`make_observation(device_id, obs_id, value)`** — factory for `Observation` structs with sensible defaults for all 20+ fields.
+- **`make_bp_observation(device_id, systolic, diastolic, map)`** — factory for blood-pressure observations.
+- **`make_waveform_observation(device_id, wave_name)`** — factory for waveform observations.
+- **`sign_care_jwt(keypair, extra_claims, exp_secs)`** — shorthand for signing a test JWT.
+
+### Refactor: Extract Router Builder
+
+Move the `Router::new().route(...)...` block in `main.rs` into:
+
+```rust
+// src/router.rs
+pub fn build_router(state: AppState, rtsptoweb_url: String) -> Router { ... }
+```
+
+`main.rs` calls `build_router(state, settings.rtsptoweb_url.clone())` — no behaviour change, but E2E tests can now spin up an identical router without duplicating route definitions.
+
+---
+
+### Layer 1: Unit Tests (inline `#[cfg(test)]` modules)
+
+#### `src/observations/validity.rs`
+
+| Test | Description |
+|---|---|
+| `test_valid_heart_rate` | HR observation with value=72.0 and status="final" → `is_valid` returns true |
+| `test_zero_value_is_invalid` | HR with value=0.0 → false |
+| `test_none_value_is_invalid` | HR with value=None → false |
+| `test_negative_value_is_invalid` | SpO2 with value=-1.0 → false |
+| `test_sensor_off_status` | status="Message-Sensor Off" (case-insensitive) → false |
+| `test_leads_off_status` | status="message-leads off" → false |
+| `test_probe_off_status` | status="message-probe off" → false |
+| `test_artifact_status` | status="message-artifact" → false |
+| `test_disconnected_status` | status="disconnected" → false |
+| `test_error_status` | status="error" → false |
+| `test_all_invalid_status_strings` | Loop through all 15 `INVALID_STATUS_STRINGS`, verify each returns false |
+| `test_valid_bp_with_systolic` | BP obs with systolic.value=Some(120.0) → true |
+| `test_bp_missing_systolic` | BP obs with systolic=None → false |
+| `test_bp_zero_systolic` | BP obs with systolic.value=Some(0.0) → false |
+| `test_bp_no_systolic_value` | BP obs with systolic=Some but value=None → false |
+| `test_waveform_always_valid` | Waveform, WaveformII, WaveformPleth, WaveformRespiration with any status → true |
+| `test_device_connection_always_valid` | DeviceConnection with any status → true |
+| `test_valid_status_with_good_value` | status="final" value=98.0 → true |
+| `test_status_substring_match` | status="some message-leads off here" → false (substring match) |
+| `test_body_temperature_valid` | BodyTemperature1 with value=36.5 → true |
+
+#### `src/observations/store.rs`
+
+| Test | Description |
+|---|---|
+| `test_new_store_is_empty` | Fresh store → `get_device_statuses()` is empty |
+| `test_ingest_single_observation` | Ingest 1 obs → device status shows "up", buffer has 1 entry |
+| `test_ingest_sets_taken_at` | Ingest obs → `taken_at` is set to approximately `Utc::now()` |
+| `test_ingest_empty_vec` | Ingest empty vec → no-op, no crash |
+| `test_ring_buffer_max_size` | Ingest >7200 obs for one device → buffer stays at 7200, oldest evicted |
+| `test_multi_device_isolation` | Ingest obs for device A and B → buffers are independent |
+| `test_bp_carry_forward` | Ingest [HR, BP], then ingest [HR] → second batch broadcast includes the carried-forward BP |
+| `test_bp_carry_forward_replaces` | Ingest [BP(120)], then [BP(130)], then [HR] → carried-forward BP has systolic=130 |
+| `test_bp_carry_forward_only_valid` | Ingest [BP with status="sensor off"], then [HR] → no carry-forward (invalid BP not stored) |
+| `test_subscribe_receives_broadcast` | Subscribe to device A, then ingest → subscriber receives the batch |
+| `test_subscribe_no_data_no_crash` | Subscribe then drop sender → receiver gets `Closed` error cleanly |
+| `test_get_static_returns_latest_per_type` | Ingest HR=70, HR=80, SpO2=95 → `get_static` returns HR=80 and SpO2=95 |
+| `test_get_static_excludes_waveforms` | Ingest HR + Waveform → `get_static` returns only HR |
+| `test_get_static_respects_since_cutoff` | Ingest old obs (>interval), then recent → only recent returned |
+| `test_get_static_no_data_returns_none` | `get_static("nonexistent")` → None |
+| `test_drain_stale_removes_old` | Ingest obs, artificially set old `taken_at`, drain → old ones removed |
+| `test_drain_stale_keeps_recent` | Drain with short duration → recent obs untouched |
+| `test_set_device_status` | `set_device_status("cam1", "down")` → `get_device_statuses` has cam1=down |
+| `test_device_status_updates_on_ingest` | Ingest for device → status is "up" with recent time |
+
+#### `src/observations/types.rs`
+
+| Test | Description |
+|---|---|
+| `test_observation_id_serde_roundtrip` | Serialize+deserialize each `ObservationId` variant → matches |
+| `test_observation_id_display` | `HeartRate.to_string()` == "heart-rate", etc. |
+| `test_observation_code_mapping` | All `AUTOMATED_OBSERVATION_TYPES` have a non-None `observation_code` |
+| `test_unit_code_mapping` | All `AUTOMATED_OBSERVATION_TYPES` have a non-None `unit_code` |
+| `test_waveform_has_no_observation_code` | `observation_code(Waveform)` → None |
+| `test_observation_json_structure` | Deserialize a full sample JSON → all fields map correctly (especially renamed fields like `date-time`, `patient-id`, `low-limit`) |
+| `test_blood_pressure_nested_deser` | Deserialize a BP observation with systolic/diastolic/map nested objects |
+
+#### `src/onvif/soap.rs`
+
+| Test | Description |
+|---|---|
+| `test_ws_security_header_structure` | Parse output XML → has `wsse:UsernameToken`, `wsse:Username`, `wsse:Password`, `wsse:Nonce`, `wsu:Created` elements |
+| `test_ws_security_digest_correctness` | Known nonce + created + password → known digest (pin one test vector by fixing the nonce) |
+| `test_soap_envelope_structure` | Output contains `<s:Envelope>`, `<s:Header>`, `<s:Body>`, the WS-Security block, and the provided body |
+| `test_get_profiles_body` | Contains `<GetProfiles xmlns="...media..."/>` |
+| `test_get_status_body` | Contains `<ProfileToken>tok</ProfileToken>` |
+| `test_get_presets_body` | Contains correct `<GetPresets>` XML |
+| `test_goto_preset_body` | Contains both `<ProfileToken>` and `<PresetToken>` |
+| `test_set_preset_body` | Contains `<PresetName>` |
+| `test_absolute_move_body` | Contains `<Position>` with `<PanTilt x="..." y="...">` and `<Zoom x="...">` |
+| `test_relative_move_body` | Contains `<Translation>` (not `<Position>`) |
+| `test_get_snapshot_uri_body` | Contains `<GetSnapshotUri>` |
+| `test_float_formatting` | pan=0.5, tilt=-0.3, zoom=0.0 → correctly embedded as strings in XML |
+
+#### `src/onvif/client.rs` — XML parser tests
+
+| Test | Description |
+|---|---|
+| `test_parse_profiles_real_xml` | Feed a realistic ONVIF GetProfiles response → correct `Vec<Profile>` |
+| `test_parse_profiles_empty` | Empty SOAP body → empty vec |
+| `test_parse_profiles_multiple` | Two `<Profiles>` elements → two entries |
+| `test_parse_ptz_status_idle` | XML with MoveStatus IDLE → `PtzStatus.move_status.pan_tilt == "IDLE"` |
+| `test_parse_ptz_status_moving` | XML with MoveStatus MOVING → correctly detected |
+| `test_parse_ptz_status_noerror` | Error field = "NO error" → normalised to `None` |
+| `test_parse_ptz_status_with_error` | Error field = "CommunicationError" → `Some("CommunicationError")` |
+| `test_parse_presets_real_xml` | Realistic presets response → correct `Vec<Preset>` |
+| `test_parse_presets_nameless` | Preset without `<Name>` element → token present, name is empty string |
+| `test_parse_snapshot_uri` | Response with `<Uri>http://...</Uri>` → extracted correctly |
+| `test_parse_snapshot_uri_missing` | No `<Uri>` element → returns `AppError::Onvif` |
+
+#### `src/onvif/lock.rs`
+
+| Test | Description |
+|---|---|
+| `test_lock_acquire_succeeds` | Fresh map → `try_lock("cam1")` succeeds |
+| `test_lock_concurrent_blocks` | Hold lock on "cam1", second `try_lock("cam1")` with short timeout → `CameraLocked` error |
+| `test_lock_release_on_drop` | Acquire lock, drop guard, re-acquire → succeeds |
+| `test_different_ips_independent` | Lock "cam1" → lock "cam2" succeeds concurrently |
+| `test_lock_timeout_configurable` | Timeout=1s, hold lock for 2s → second attempt returns `CameraLocked` |
+
+#### `src/config.rs`
+
+| Test | Description |
+|---|---|
+| `test_defaults` | No env vars set (clear all) → `Settings::from_env()` uses all defaults: host=0.0.0.0, port=8090, etc. |
+| `test_s3_configured_all_set` | Set all 3 S3 vars → `s3_configured()` true |
+| `test_s3_configured_partial` | Only access_key set → `s3_configured()` false |
+| `test_automated_obs_enabled_from_device_id` | `GATEWAY_DEVICE_ID` set, no explicit enabled → enabled=true |
+| `test_automated_obs_disabled_explicit` | `AUTOMATED_OBSERVATIONS_ENABLED=false` → enabled=false even with device_id set |
+| `test_empty_optional_strings_become_none` | Set `SENTRY_DSN=""` → `sentry_dsn` is None |
+| `test_bind_port_parse_error` | `BIND_PORT=abc` → `from_env()` returns Err |
+
+#### `src/error.rs`
+
+| Test | Description |
+|---|---|
+| `test_not_found_response` | `AppError::NotFound.into_response()` → 404 with `{"error":"not found"}` |
+| `test_unauthorized_response` | → 401 |
+| `test_camera_locked_response` | → 409 |
+| `test_invalid_camera_credentials_response` | → 400 |
+| `test_onvif_error_response` | → 502 |
+| `test_care_api_error_response` | → 502 |
+| `test_db_error_response` | → 500, body says "database error" (not leaking details) |
+| `test_internal_error_response` | → 500, body says "internal error" (not leaking details) |
+
+#### `src/auth/outbound.rs`
+
+| Test | Description |
+|---|---|
+| `test_generate_keypair` | `load_or_generate(tempdir, None)` with no existing file → generates keypair, file created |
+| `test_load_from_file` | Generate, then load again → same public key `n` and `e` |
+| `test_load_from_base64` | Base64-encode a generated JWKS → `load_or_generate(dir, Some(b64))` succeeds |
+| `test_sign_and_verify_roundtrip` | `sign_jwt(claims, 300)` → `verify_jwt(token)` → claims match |
+| `test_verify_expired_token` | `sign_jwt(claims, 0)` (immediate expiry) → `verify_jwt` fails |
+| `test_verify_garbage_token` | `verify_jwt("not.a.jwt")` → error |
+| `test_public_jwks_structure` | `public_jwks()` → has `keys` array with one entry, fields `kty`, `use`, `alg`, `n`, `e` |
+
+#### `src/db/assets.rs`
+
+| Test | Description |
+|---|---|
+| `test_encrypt_decrypt_roundtrip` | Encrypt "mypassword" → decrypt → "mypassword" |
+| `test_decrypt_wrong_key` | Encrypt with key A, decrypt with key B → error |
+| `test_decrypt_too_short` | Decrypt 5 bytes → error |
+| `test_encrypt_bad_key_length` | Key of 16 bytes (not 32) → error |
+| `test_hex_decode_valid` | "48656c6c6f" → [72,101,108,108,111] |
+| `test_hex_decode_odd_length` | "123" → error |
+| `test_create_and_get_asset` | Create asset → get by ID → fields match |
+| `test_list_assets_empty` | Fresh DB → empty vec |
+| `test_list_assets_by_type` | Create ONVIF + HL7MONITOR → list(type=ONVIF) returns only ONVIF |
+| `test_soft_delete` | Create → delete → list returns empty, get still returns (with deleted=true) |
+| `test_delete_nonexistent` | Delete random UUID → `NotFound` |
+| `test_asset_type_fromstr` | "ONVIF" → Ok, "INVALID" → Err |
+
+#### `src/api/stream.rs`
+
+| Test | Description |
+|---|---|
+| `test_parse_duration_none` | None → 5 |
+| `test_parse_duration_valid` | Some("10") → 10 |
+| `test_parse_duration_clamp_high` | Some("120") → 60 |
+| `test_parse_duration_clamp_low` | Some("0") → 1 |
+| `test_parse_duration_non_numeric` | Some("abc") → 5 |
+
+#### `src/tasks/automated_observations.rs`
+
+| Test | Description |
+|---|---|
+| `test_build_observation_specs_heart_rate` | HR obs value=72 → spec with LOINC code 8867-4, unit /min, value "72" |
+| `test_build_observation_specs_spo2` | SpO2 obs value=98 → LOINC 2708-6, unit % |
+| `test_build_observation_specs_bp` | BP obs systolic=120 → LOINC 85354-9, unit mmHg, value "120" |
+| `test_build_observation_specs_skips_waveform` | Waveform obs → empty specs |
+| `test_build_observation_specs_skips_invalid` | HR with status="sensor off" → empty specs |
+| `test_build_observation_specs_with_reference_range` | HR with low_limit=60 high_limit=100 → reference_range populated |
+| `test_build_observation_specs_integer_vs_decimal` | value=72.0 → value_type="integer"; value=36.5 → value_type="decimal" |
+
+---
+
+### Layer 2: Integration / E2E Tests (`tests/` directory)
+
+These tests spin up a real Axum server (in-memory SQLite, mock CARE API via `wiremock`) and make actual HTTP requests.
+
+#### Test Harness (`tests/common/mod.rs`)
+
+- `spawn_app()` → boots the full app on a random port with an in-memory DB, returns `TestApp { addr, state, care_mock: MockServer }`.
+- `TestApp::url(path)` → `format!("http://{}{}", self.addr, path)`.
+- `TestApp::care_bearer_header()` → signs a JWT with the app's own keypair (for routes that require `CareAuth`, the test configures the CARE JWKS mock to return the app's own public key, so the same key works for both directions).
+
+#### `tests/health_endpoints.rs`
+
+| Test | Description |
+|---|---|
+| `test_healthz` | GET `/healthz` → 200, body has `server: "ok"`, `database: "ok"` |
+| `test_ping` | GET `/health/ping` → 200, body has `pong` with an RFC3339 timestamp |
+| `test_status` | GET `/health/status` → 200, body has `version` field |
+| `test_care_communication_success` | Mock CARE `/middleware/verify` → 200 → endpoint returns the mocked body |
+| `test_care_communication_unreachable` | No mock → endpoint returns error gracefully |
+
+#### `tests/observation_endpoints.rs`
+
+| Test | Description |
+|---|---|
+| `test_update_observations_from_loopback` | POST `/update_observations` from 127.0.0.1 with valid JSON → 200 |
+| `test_update_observations_empty_array` | POST `[]` → 200 (no-op) |
+| `test_update_observations_malformed_json` | POST garbage → 4xx |
+| `test_device_status_requires_auth` | GET `/devices/status` with no Authorization header → 401 |
+| `test_device_status_with_auth` | GET `/devices/status` with valid Care_Bearer → 200 with device status map |
+| `test_device_status_after_ingest` | Ingest obs for device A → GET `/devices/status` → device A shows "up" |
+
+#### `tests/camera_endpoints.rs`
+
+| Test | Description |
+|---|---|
+| `test_get_presets_requires_auth` | No auth → 401 |
+| `test_get_camera_status_requires_auth` | No auth → 401 |
+| `test_absolute_move_requires_auth` | No auth → 401 |
+| `test_goto_preset_missing_preset_index` | Valid auth, body without `preset` → appropriate error |
+| `test_camera_endpoints_bad_credentials` | Point at wiremock returning 401 → `InvalidCameraCredentials` |
+
+#### `tests/stream_endpoints.rs`
+
+| Test | Description |
+|---|---|
+| `test_get_video_feed_token` | POST `/getToken/videoFeed` with auth → 200, body has `token` field |
+| `test_get_vitals_token` | POST `/getToken/vitals` with auth → 200, body has `token` |
+| `test_verify_token_valid` | Generate token → POST `/verifyToken` with matching ip → status "1" |
+| `test_verify_token_invalid` | POST `/verifyToken` with garbage token → status "0", 401 |
+| `test_verify_token_wrong_ip` | Generate token for ip=A → verify with ip=B and no stream → status "0" |
+| `test_exchange_token_care_rejects` | Mock CARE verify → 401 → our endpoint returns Unauthorized |
+| `test_exchange_token_care_accepts` | Mock CARE verify → 200 → our endpoint returns a gateway JWT |
+
+#### `tests/openid_configuration.rs`
+
+| Test | Description |
+|---|---|
+| `test_openid_configuration_returns_jwks` | GET `/openid-configuration/` → 200, body has `keys` array with at least one RSA key |
+| `test_openid_key_has_required_fields` | Key has `kty`, `use`, `alg`, `n`, `e` |
+
+#### `tests/websocket.rs`
+
+| Test | Description |
+|---|---|
+| `test_ws_observations_no_token` | Connect to `/observations/1.2.3.4` without Sec-WebSocket-Protocol → immediately closed |
+| `test_ws_observations_bad_token` | Connect with invalid JWT → immediately closed |
+| `test_ws_observations_receives_data` | Connect with valid token → ingest observations for that IP → WS receives the JSON batch |
+| `test_ws_logger_streams_metrics` | Connect to `/logger` → receive at least one message with `type: "RESOURCE"`, `cpu`, `memory`, `uptime`, `load` |
+
+#### `tests/auth_flow.rs`
+
+| Test | Description |
+|---|---|
+| `test_care_bearer_valid_token` | Sign JWT with the mock CARE private key → `CareAuth` extractor succeeds |
+| `test_care_bearer_expired_token` | Sign JWT with exp in the past → 401 |
+| `test_care_bearer_wrong_key` | Sign JWT with a different RSA key → 401 |
+| `test_care_bearer_missing_header` | No Authorization header → 401 |
+| `test_care_bearer_wrong_prefix` | `Authorization: Bearer <token>` (not `Care_Bearer`) → 401 |
+| `test_jwks_cache_refresh` | First request fetches JWKS, second within 5min uses cache (verify with mock hit count) |
+
+#### `tests/proxy.rs`
+
+| Test | Description |
+|---|---|
+| `test_proxy_start_route` | Mock rtsptoweb → GET `/start` → proxied correctly, response matches |
+| `test_proxy_preserves_query_params` | GET `/stream?id=foo` → upstream sees `?id=foo` |
+| `test_proxy_forwards_post_body` | POST `/stop` with body → upstream receives same body |
+| `test_proxy_upstream_down` | No mock → returns 5xx gracefully |
+
+---
+
+### Layer 3: Edge-Case & Stress Tests
+
+| Test | Description |
+|---|---|
+| `test_concurrent_observation_ingest` | 100 tokio tasks ingesting simultaneously → no panics, no data corruption |
+| `test_concurrent_camera_lock_contention` | 10 tasks trying to lock same camera → exactly 1 succeeds, rest get `CameraLocked` |
+| `test_observation_store_memory_bound` | Ingest 100k observations → buffer per device stays at 7200 |
+| `test_drain_stale_under_concurrent_ingest` | Drain + ingest simultaneously → no deadlock |
+| `test_ws_client_disconnect_during_broadcast` | Subscribe, ingest, drop WS mid-send → server doesn't panic |
+| `test_large_observation_batch` | Ingest 10,000 observations in one POST → succeeds |
+| `test_malformed_observation_fields` | Missing required fields → serde returns 4xx, not 500 |
+| `test_unicode_in_patient_name` | patient_name with CJK / emoji characters → roundtrips correctly |
+| `test_very_long_device_id` | 10KB device_id string → doesn't crash (may reject) |
+| `test_s3_dump_no_stale_data` | S3 dump with no stale data → no-op, no S3 call |
+| `test_keypair_file_permissions` | Generated jwks.json is not world-readable (Unix only) |
+
+---
+
+### CI Configuration
+
+Add a GitHub Actions workflow (`.github/workflows/test.yml`):
+
+1. **`cargo fmt --check`** — enforce formatting.
+2. **`cargo clippy -- -D warnings`** — zero warnings policy.
+3. **`cargo test`** — run all unit + integration tests.
+4. **`cargo test -- --ignored`** — optional slow/stress tests gated behind `#[ignore]`.
+
+All tests should run in under 60 seconds on CI. Use `#[ignore]` for stress tests that take longer.
+
+---
+
+### Implementation Order
+
+1. Add dev-dependencies to `Cargo.toml`.
+2. Refactor: extract `build_router()` into `src/router.rs`.
+3. Create `src/test_helpers.rs` with `test_settings()`, `test_app_state()`, factory functions.
+4. Write unit tests for pure-logic modules first (fastest feedback loop):
+   - `observations/validity.rs`
+   - `observations/types.rs`
+   - `onvif/soap.rs`
+   - `onvif/client.rs` (XML parsers)
+   - `onvif/lock.rs`
+   - `error.rs`
+   - `config.rs`
+   - `db/assets.rs` (encryption + DB CRUD)
+   - `api/stream.rs` (`parse_duration_mins`)
+   - `auth/outbound.rs` (keypair + JWT sign/verify)
+   - `observations/store.rs`
+   - `tasks/automated_observations.rs` (`build_observation_specs`)
+5. Write E2E tests using `wiremock` + real Axum server:
+   - `tests/common/mod.rs` (harness)
+   - Health, observation, camera, stream, openid, websocket, auth, proxy test files.
+6. Write stress/edge-case tests (tagged `#[ignore]`).
+7. Add CI workflow.
+
+---
+
+## Plan 2: Status Page at `GET /`
+
+### Goal
+
+Serve an HTML status dashboard at the root path (`/`) of the web server so that operators can open the gateway's address in a browser and immediately see whether everything is healthy — database connectivity, CARE API reachability, connected devices, background task health, and system resource usage.
+
+### Route
+
+Add `GET /` → `api::status::index` returning `Content-Type: text/html`.
+
+### Implementation
+
+#### New File: `src/api/status.rs`
+
+Handler: `pub async fn index(State(state): State<AppState>) -> impl IntoResponse`
+
+The handler gathers all status data and renders an HTML page (no template engine — just a raw string with inline CSS, keeping dependencies at zero). The page auto-refreshes every 30 seconds via `<meta http-equiv="refresh" content="30">`.
+
+#### Data Gathered
+
+| Section | Source | Details |
+|---|---|---|
+| **Gateway Info** | `state.settings` | App version, hostname, gateway device ID, bind address, uptime (track start time in `AppState`) |
+| **Database** | `sqlx::query("SELECT 1")` on `state.db` | Status: ✅ OK or ❌ Error |
+| **CARE API** | `state.http.get(care_api + "/middleware/verify")` | Status: ✅ Reachable / ❌ Unreachable, response time in ms |
+| **RSA Keypair** | `state.own_keypair` | Key ID (first 8 chars of base64url `n`), algorithm (RS256) |
+| **S3** | `state.settings.s3_configured()` | Configured: Yes/No, bucket name |
+| **Sentry** | `state.settings.sentry_dsn` | Configured: Yes/No |
+| **Connected Devices** | `state.obs_store.get_device_statuses()` | Table: Device IP, Status (up/down with colored badge), Last Seen timestamp |
+| **Observation Store** | `state.obs_store` | Total devices tracked, total observations buffered (sum of all ring buffer lengths) |
+| **Background Tasks** | New `TaskHealth` struct in `AppState` | Last run time + status for: automated observations, camera status sweep, S3 dump |
+| **System Resources** | `sysinfo::System` | CPU %, memory %, uptime — same data as the `/logger` WebSocket but as a one-shot snapshot |
+
+#### Add to `AppState`
+
+```rust
+pub struct TaskHealth {
+    pub last_run: Option<DateTime<Utc>>,
+    pub last_status: String,  // "ok", "error: <msg>", "disabled"
+}
+
+// In AppState:
+pub started_at: DateTime<Utc>,
+pub task_health: Arc<DashMap<String, TaskHealth>>,
+```
+
+Background tasks update `task_health` after each cycle (key = "automated_observations" / "camera_status" / "s3_dump").
+
+#### Add Observation Store Method
+
+Add `pub fn total_buffered(&self) -> usize` to `ObservationStore` — sums all ring buffer lengths for the status page.
+
+#### HTML Design
+
+Minimal, dependency-free HTML with inline CSS. Dark-themed, responsive, single-page. Sections:
+
+1. **Header** — "TeleICU Gateway" + version badge + hostname.
+2. **Health Summary** — 3 status cards: Database, CARE API, S3. Green/red badges.
+3. **Devices Table** — sortable by status, shows IP, status badge, last seen (relative time like "2m ago").
+4. **Background Tasks Table** — task name, last run, status, next run (estimated from interval).
+5. **System Resources** — CPU bar, memory bar, uptime.
+6. **Footer** — auto-refresh countdown, link to `/healthz` JSON endpoint.
+
+#### Route Registration in `main.rs`
+
+```rust
+.route("/", get(api::status::index))
+```
+
+Add `pub mod status;` to `src/api/mod.rs`.
+
+### Implementation Order
+
+1. Add `started_at: DateTime<Utc>` and `task_health: Arc<DashMap<String, TaskHealth>>` to `AppState`.
+2. Update background tasks to write to `task_health` after each cycle.
+3. Add `ObservationStore::total_buffered()`.
+4. Create `src/api/status.rs` with the HTML rendering handler.
+5. Register `GET /` route in the router.
+6. Add tests: `test_status_page_returns_html` (200, content-type text/html), `test_status_page_contains_version`.

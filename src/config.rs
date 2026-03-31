@@ -39,7 +39,7 @@ impl Settings {
                 .unwrap_or_else(|_| "8090".into())
                 .parse()?,
             database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "sqlite:./gateway.db".into()),
+                .unwrap_or_else(|_| "sqlite:./gateway.db?mode=rwc".into()),
             care_api: std::env::var("CARE_API")
                 .unwrap_or_else(|_| "https://care.10bedicu.in".into()),
             care_api_timeout_secs: std::env::var("CARE_API_TIMEOUT_SECS")

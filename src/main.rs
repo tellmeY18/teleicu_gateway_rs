@@ -29,7 +29,10 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env file (ignore errors if not present)
-    let _ = dotenvy::dotenv();
+    match dotenvy::dotenv() {
+        Ok(path) => eprintln!("[boot] Loaded .env from {}", path.display()),
+        Err(e) => eprintln!("[boot] No .env file loaded: {e}"),
+    }
 
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -41,15 +44,65 @@ async fn main() -> anyhow::Result<()> {
 
     // Load settings
     let settings = Settings::from_env()?;
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<error: {e}>"));
+
     tracing::info!(
         "Starting TeleICU Gateway v{} on {}:{}",
         settings.app_version,
         settings.bind_host,
         settings.bind_port
     );
+    tracing::info!("  cwd            = {cwd}");
+    tracing::info!("  DATABASE_URL   = {}", settings.database_url);
+    tracing::info!("  STATE_DIR      = {}", settings.state_dir);
+    tracing::info!("  CARE_API       = {}", settings.care_api);
+    tracing::info!("  RTSPTOWEB_URL  = {}", settings.rtsptoweb_url);
+    tracing::info!("  GATEWAY_DEVICE_ID = {}", if settings.gateway_device_id.is_empty() { "<not set>" } else { &settings.gateway_device_id });
+    tracing::info!("  JWKS_BASE64    = {}", if settings.jwks_base64.is_some() { "<set>" } else { "<not set>" });
+    tracing::info!("  S3 configured  = {}", settings.s3_configured());
+    tracing::info!("  SENTRY_DSN     = {}", if settings.sentry_dsn.is_some() { "<set>" } else { "<not set>" });
+    tracing::info!("  auto_obs       = {} (interval {}m)", settings.automated_observations_enabled, settings.automated_observations_interval_mins);
+
+    // Resolve the database file path from the URL for pre-flight checks
+    let db_file_path = settings.database_url
+        .strip_prefix("sqlite:")
+        .unwrap_or(&settings.database_url);
+    let db_path = std::path::Path::new(db_file_path);
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            tracing::warn!(
+                "Database parent directory does not exist: {} (resolved from cwd {cwd})",
+                parent.display()
+            );
+            tracing::info!("Creating database directory: {}", parent.display());
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create database directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    tracing::debug!("Database file path resolved to: {}", db_path.display());
+
+    // Check state_dir
+    let state_path = std::path::Path::new(&settings.state_dir);
+    if !state_path.exists() {
+        tracing::info!("STATE_DIR does not exist, creating: {}", state_path.display());
+        std::fs::create_dir_all(state_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create STATE_DIR {}: {e}",
+                state_path.display()
+            )
+        })?;
+    }
 
     // Initialize Sentry
     let _sentry_guard = settings.sentry_dsn.as_ref().map(|dsn| {
+        tracing::info!("Initializing Sentry");
         sentry::init((
             dsn.as_str(),
             sentry::ClientOptions {
@@ -61,10 +114,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Connect to SQLite
+    tracing::info!("Connecting to database: {}", settings.database_url);
     let db = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&settings.database_url)
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open database '{}' (cwd: {cwd}): {e}",
+                settings.database_url,
+            )
+        })?;
+    tracing::info!("Database connection established");
 
     // Run migrations
     sqlx::migrate!("./migrations").run(&db).await?;
