@@ -1,0 +1,27 @@
+# CI: format, lint, test on every push/PR to main
+when:
+  - event: ["push", "pull_request"]
+    branch: main
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - cargo
+    - rustc
+    - rustfmt
+    - clippy
+    - gcc
+    - pkg-config
+    - sqlite
+    - perl
+
+steps:
+  - name: Check formatting
+    command: cargo fmt --check
+
+  - name: Clippy lint
+    command: cargo clippy -- -D warnings
+
+  - name: Run tests
+    command: cargo test

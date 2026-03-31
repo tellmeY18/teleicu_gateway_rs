@@ -1339,3 +1339,170 @@ Add `pub mod status;` to `src/api/mod.rs`.
 4. Create `src/api/status.rs` with the HTML rendering handler.
 5. Register `GET /` route in the router.
 6. Add tests: `test_status_page_returns_html` (200, content-type text/html), `test_status_page_contains_version`.
+
+## Plan 3: Binary Generation with Spindle on Tangled.org
+
+### Goal
+
+Produce release binaries for Linux using the Spindle workflow runner on Tangled.org. Each push to `main` (or tagged release) triggers Spindle to build an optimized binary and run CI checks. Spindle uses the **nixery** engine, which constructs container images on-the-fly from **nixpkgs** — no Dockerfile needed.
+
+### Key Learnings from Tangled/Spindle Docs
+
+**Spindle is NOT GitHub Actions.** The workflow format is entirely different:
+
+- **Directory**: `.tangled/workflows/` (not `.github/workflows/` or `.spindle/`)
+- **Trigger**: `when:` field with `event:` and `branch:`/`tag:` (not `on:`)
+- **Engine**: `engine: nixery` (not `runs-on:`)
+- **Dependencies**: `dependencies.nixpkgs:` lists nix packages (not `apt-get` or `uses:`)
+- **Steps**: Flat list of `name:` + `command:` pairs (not `jobs:` with nested `steps:`)
+- **No matrix builds**: Each workflow is a single sequential pipeline
+- **No `uses:` actions**: No `actions/checkout`, `actions/upload-artifact`, etc. — the repo is auto-cloned
+- **No `runs-on:`**: The engine field determines the execution environment
+- **Per-step `environment:`**: Environment variables can be set globally or per-step
+
+Reference: Tangled core repo `.tangled/workflows/` at https://tangled.org/tangled.org/core
+
+### Supported Targets (Linux Only)
+
+| Target Triple | Notes |
+|---|---|
+| `x86_64-unknown-linux-gnu` | Primary deployment target (NixOS, Debian, Ubuntu). Native build on nixery x86_64 runner. |
+
+> **Future targets** (require cross-compilation tooling or separate runners, deferred for now):
+> - `x86_64-unknown-linux-musl` — Static binary, needs musl toolchain in nix
+> - `aarch64-unknown-linux-gnu` — ARM64, needs cross-linker
+> - `aarch64-unknown-linux-musl` — Static ARM64, needs both
+
+### Spindle CI Workflow (`.tangled/workflows/ci.yml`)
+
+Runs on every push/PR to `main`. Checks formatting, lints, and runs tests.
+
+```yaml
+# .tangled/workflows/ci.yml
+when:
+  - event: ["push", "pull_request"]
+    branch: main
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - cargo
+    - rustc
+    - rustfmt
+    - clippy
+    - gcc
+    - pkg-config
+    - sqlite
+    - perl
+    - binutils
+
+steps:
+  - name: Check formatting
+    command: cargo fmt --check
+
+  - name: Clippy lint
+    command: cargo clippy -- -D warnings
+
+  - name: Run tests
+    command: cargo test
+```
+
+#### Nixpkgs dependency rationale
+
+| Package | Why |
+|---|---|
+| `cargo`, `rustc` | Rust toolchain from nixpkgs stable |
+| `rustfmt`, `clippy` | Separate nixpkgs packages for formatting and linting |
+| `gcc` | C linker + compiler for `ring`, `libsqlite3-sys` build scripts |
+| `pkg-config` | Build script dependency resolution (sqlite, etc.) |
+| `sqlite` | System sqlite3 headers/lib for `sqlx` `sqlite` feature |
+| `perl` | Required by `ring` crate's build script |
+| `binutils` | `strip` command for reducing binary size |
+
+### Spindle Build Workflow (`.tangled/workflows/build.yml`)
+
+Runs on pushes to `main` and on version tags. Builds a release-optimized binary for x86_64 Linux.
+
+```yaml
+# .tangled/workflows/build.yml
+when:
+  - event: push
+    branch: main
+    tag: ["v*"]
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - cargo
+    - rustc
+    - gcc
+    - pkg-config
+    - sqlite
+    - perl
+    - binutils
+    - coreutils
+
+steps:
+  - name: Build release binary
+    command: cargo build --release
+
+  - name: Strip binary
+    command: strip target/release/teleicu-gateway
+
+  - name: Show binary info
+    command: |
+      ls -lh target/release/teleicu-gateway
+      file target/release/teleicu-gateway
+
+  - name: Package artifact
+    command: |
+      mkdir -p dist
+      cp target/release/teleicu-gateway dist/teleicu-gateway-x86_64-unknown-linux-gnu
+      sha256sum dist/teleicu-gateway-x86_64-unknown-linux-gnu > dist/teleicu-gateway-x86_64-unknown-linux-gnu.sha256
+      cat dist/teleicu-gateway-x86_64-unknown-linux-gnu.sha256
+```
+
+### How Spindle Works (Architecture Notes)
+
+1. **Trigger**: Spindle listens to repo events via AT Protocol Jetstream. When a push matches a workflow's `when:` conditions, the pipeline is queued.
+2. **Clone**: The repo is automatically cloned into `/tangled/workspace` (depth 1 by default). No `actions/checkout` needed.
+3. **Container**: Nixery constructs a container image on-the-fly containing the listed nixpkgs packages. Layers are cached for frequently used packages.
+4. **Steps**: Each step runs sequentially in the same container. State in `/tangled/workspace` persists across steps within a single pipeline run.
+5. **Logs**: Step output is streamed via WebSocket and visible on the Tangled pipelines page.
+6. **Timeout**: Default workflow timeout is 5 minutes (configurable by spindle operator via `SPINDLE_PIPELINES_WORKFLOW_TIMEOUT`).
+7. **Secrets**: Can be added via the repository settings page on Tangled. They're injected as environment variables at runtime. **Never put secrets in the workflow YAML** — those are visible to anyone viewing the repo.
+8. **Built-in env vars**: `CI=true`, `TANGLED_SHA`, `TANGLED_REF_NAME`, `TANGLED_REF_TYPE`, `TANGLED_REPO_NAME`, etc. are automatically available.
+
+### Binary Naming Convention
+
+Artifacts follow the pattern: `teleicu-gateway-{target_triple}`
+
+Primary artifact:
+- `teleicu-gateway-x86_64-unknown-linux-gnu`
+- `teleicu-gateway-x86_64-unknown-linux-gnu.sha256`
+
+### Versioning
+
+The binary version is derived from `Cargo.toml` via `env!("CARGO_PKG_VERSION")` at compile time. Tags must match the `Cargo.toml` version (e.g., tag `v0.1.0` corresponds to `version = "0.1.0"` in `Cargo.toml`).
+
+### Important: No TLS Feature Flags Needed
+
+The project already uses `rustls` everywhere (no OpenSSL dependency):
+- `reqwest` with `rustls-tls` and `default-features = false`
+- `sqlx` with `runtime-tokio-rustls`
+- `jsonwebtoken` uses `ring` (pure Rust/asm)
+- `rsa` crate is pure Rust
+
+This means we do **not** need `openssl` or `openssl.dev` in nixpkgs dependencies, and no feature flag changes are needed for the build.
+
+### Implementation Order
+
+1. Create `.tangled/workflows/ci.yml` with fmt, clippy, and test steps.
+2. Create `.tangled/workflows/build.yml` with release build + strip + package steps.
+3. Test locally with `cargo build --release` to confirm the build works.
+4. Push to Tangled.org, verify Spindle picks up and runs both workflows.
+5. Check pipeline logs on the Tangled pipelines page for the repo.
+6. Tag a test release (`v0.0.1-rc1`), verify the build workflow triggers on the tag.
+7. (Future) Add musl static build workflow once musl cross-compilation is validated in nixery.

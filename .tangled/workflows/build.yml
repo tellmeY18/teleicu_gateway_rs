@@ -1,0 +1,41 @@
+# Build: compile release binary on push to main or version tags
+when:
+  - event: push
+    branch: main
+    tag: ["v*"]
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - cargo
+    - rustc
+    - gcc
+    - pkg-config
+    - sqlite
+    - perl
+    - binutils
+    - coreutils
+    - file
+
+steps:
+  - name: Build release binary
+    command: cargo build --release
+
+  - name: Strip binary
+    command: strip target/release/teleicu-gateway
+
+  - name: Show binary info
+    command: |
+      ls -lh target/release/teleicu-gateway
+      file target/release/teleicu-gateway
+
+  - name: Package artifact
+    command: |
+      mkdir -p dist
+      cp target/release/teleicu-gateway dist/teleicu-gateway-x86_64-unknown-linux-gnu
+      sha256sum dist/teleicu-gateway-x86_64-unknown-linux-gnu > dist/teleicu-gateway-x86_64-unknown-linux-gnu.sha256
+      echo "=== SHA256 ==="
+      cat dist/teleicu-gateway-x86_64-unknown-linux-gnu.sha256
+      echo "=== Artifact size ==="
+      ls -lh dist/
