@@ -190,6 +190,128 @@ In the Rust rewrite, all of this routing logic moves inside the binary. No Nginx
 
 ---
 
+## Demo with HTTPS
+
+For demos or local development where HTTPS is required (e.g. CARE expects `https://`), the flake includes a one-command launcher that runs the gateway behind [Caddy](https://caddyserver.com/) with an auto-generated self-signed certificate.
+
+### One command (Nix builds everything)
+
+```sh
+nix run .#demo
+```
+
+This builds the gateway from source, starts it on `http://127.0.0.1:8090`, and launches Caddy as an HTTPS reverse proxy on `https://localhost:8443`. No Rust toolchain, no Caddy install, no cert generation — Nix handles all of it.
+
+### From the dev shell (if you're already iterating)
+
+```sh
+nix develop .#demo
+./dev/demo.sh
+```
+
+This uses the `demo` dev shell (which includes Caddy + curl alongside the Rust toolchain) and runs the same launcher script, except it uses your local `cargo build --release` binary instead of building via Nix.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DEMO_PORT` | `8443` | HTTPS port Caddy listens on |
+| `BIND_PORT` | `8090` | HTTP port the gateway listens on (internal) |
+| `GATEWAY_DEVICE_ID` | `demo-gateway` | Auto-set if not provided |
+
+All other gateway env vars (`.env` file, `CARE_API`, etc.) work as normal.
+
+### What it does
+
+```
+Browser / CARE
+    │ https://localhost:8443
+    ▼
+┌─────────────────────────┐
+│  Caddy (self-signed TLS)│
+│  :8443 → localhost:8090 │
+└────────────┬────────────┘
+             │ http
+             ▼
+┌─────────────────────────┐
+│  teleicu-gateway        │
+│  :8090 (plain HTTP)     │
+└─────────────────────────┘
+```
+
+Caddy generates a locally-trusted self-signed certificate on first run. Your browser will show a security warning — accept it to proceed. The gateway binary itself is unchanged; TLS terminates entirely at Caddy.
+
+Press `Ctrl+C` to stop both processes.
+
+> **Production note:** This is for demos only. In production, use the NixOS module (which can sit behind a real reverse proxy with proper certs) or terminate TLS at your infrastructure layer.
+
+---
+
+## Getting the Binary
+
+### Option 1: Build locally with Nix (recommended)
+
+The flake produces a fully reproducible binary. No Rust toolchain needed on your machine — Nix handles everything:
+
+```sh
+nix build github:10BedICU/teleicu_gateway_rs
+# binary at ./result/bin/teleicu-gateway
+```
+
+Or from a local checkout:
+
+```sh
+nix build
+./result/bin/teleicu-gateway --help
+```
+
+To copy the built binary to a remote machine:
+
+```sh
+# copy the Nix store path to a remote NixOS host
+nix copy --to ssh://root@ward-device .#default
+
+# or just scp the binary directly
+scp result/bin/teleicu-gateway root@ward-device:/usr/local/bin/
+```
+
+### Option 2: Build locally with Cargo
+
+Requires the Rust toolchain, SQLite, and (on macOS) libiconv. Use the Nix dev shell to get all dependencies:
+
+```sh
+nix develop            # enter dev shell with all native deps
+cargo build --release  # binary at target/release/teleicu-gateway
+```
+
+> **macOS note:** Always use `nix develop` before `cargo build`. The project depends on `libiconv` and `sqlite` which the flake's dev shell provides. Building outside the shell will fail with linker errors.
+
+### Option 3: NixOS module (production deployments)
+
+For NixOS target machines, skip the binary entirely — import the flake's NixOS module and let systemd manage everything:
+
+```nix
+services.teleicu-gateway = {
+  enable = true;
+  environmentFile = "/run/secrets/teleicu-gateway.env";
+  rtsptowebConfigFile = ./rtsptoweb.json;
+};
+```
+
+The module builds the binary from source as part of the NixOS system closure. Running `nixos-rebuild switch` on the target machine builds, deploys, and restarts the service in one step.
+
+### What about CI on Tangled?
+
+The repository has Spindle CI workflows (`.tangled/workflows/`) that build and test on every push to `main`. These verify the binary compiles and tests pass, but **Spindle does not currently support artifact downloads** — there's no equivalent of GitHub Releases or `actions/upload-artifact`. The build container's filesystem is ephemeral.
+
+What the CI *does* do:
+- **`ci.yml`** — runs `cargo fmt --check`, `cargo clippy`, and `cargo test` on every push/PR
+- **`build.yml`** — runs `cargo build --release`, strips the binary, and logs the size + SHA256
+
+You can view pipeline results on the repository's pipelines page on Tangled.org, but to actually get a binary, use one of the three options above.
+
+---
+
 ## NixOS Target
 
 One binary + one SQLite file. `rtsptoweb` runs as a separate systemd service in the same NixOS module. The gateway manages its own RSA keypair (generate on first boot, persist to `StateDirectory`). Zero Docker.

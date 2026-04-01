@@ -1,0 +1,17 @@
+# Self-signed HTTPS reverse proxy for demo purposes.
+# Caddy automatically generates a self-signed cert when
+# the site address is "localhost".
+#
+# {{DEMO_PORT}} and {{GATEWAY_PORT}} are replaced at runtime by the demo script.
+
+localhost:{{DEMO_PORT}} {
+	tls internal
+
+	reverse_proxy localhost:{{GATEWAY_PORT}} {
+		# Pass WebSocket upgrades through
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    tracing::info!("Listening on {bind_addr}");
+    tracing::info!("Listening on http://{bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(
         listener,

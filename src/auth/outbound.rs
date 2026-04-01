@@ -62,10 +62,11 @@ impl OwnKeypair {
 
         let keypair = Self::from_rsa_private_key(private_key)?;
 
-        // Persist to state_dir
+        // Persist full private key to state_dir so it can be reloaded on restart
         fs::create_dir_all(state_dir)?;
+        let private_jwk = Self::private_key_to_jwk(&keypair.private_key)?;
         let jwks_json = json!({
-            "keys": [keypair.public_jwk.clone()]
+            "keys": [private_jwk]
         });
         fs::write(&key_path, serde_json::to_string_pretty(&jwks_json)?)?;
         tracing::info!("Saved keypair to {}", key_path.display());
@@ -168,6 +169,48 @@ impl OwnKeypair {
         json!({
             "keys": [self.public_jwk.clone()]
         })
+    }
+
+    /// Serialize the full RSA private key as a JWK value (includes d, p, q, dp, dq, qi).
+    fn private_key_to_jwk(key: &RsaPrivateKey) -> anyhow::Result<Value> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use rsa::traits::PrivateKeyParts;
+
+        let public_key = key.to_public_key();
+        let n_b64 = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
+        let e_b64 = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+        let d_b64 = URL_SAFE_NO_PAD.encode(key.d().to_bytes_be());
+
+        let primes = key.primes();
+        let mut jwk = json!({
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "n": n_b64,
+            "e": e_b64,
+            "d": d_b64,
+        });
+
+        if primes.len() >= 2 {
+            jwk["p"] = json!(URL_SAFE_NO_PAD.encode(primes[0].to_bytes_be()));
+            jwk["q"] = json!(URL_SAFE_NO_PAD.encode(primes[1].to_bytes_be()));
+
+            // Include CRT components if available (dp, dq, qi)
+            if let Some(dp) = key.dp() {
+                jwk["dp"] = json!(URL_SAFE_NO_PAD.encode(dp.to_bytes_be()));
+            }
+            if let Some(dq) = key.dq() {
+                jwk["dq"] = json!(URL_SAFE_NO_PAD.encode(dq.to_bytes_be()));
+            }
+            if let Some(qi) = key.qinv() {
+                let qi_bytes = qi.to_biguint()
+                    .map(|b| b.to_bytes_be())
+                    .unwrap_or_default();
+                jwk["qi"] = json!(URL_SAFE_NO_PAD.encode(qi_bytes));
+            }
+        }
+
+        Ok(jwk)
     }
 }
 
