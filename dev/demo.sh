@@ -43,12 +43,17 @@ if ! command -v caddy &>/dev/null; then
     exit 1
 fi
 
-# Build gateway if needed
-GATEWAY_BIN="$PROJECT_DIR/target/release/teleicu-gateway"
-if [[ ! -x "$GATEWAY_BIN" ]]; then
-    echo "── Building gateway (release) ──"
-    (cd "$PROJECT_DIR" && cargo build --release)
+if ! command -v cargo &>/dev/null; then
+    echo "Error: 'cargo' not found in PATH."
+    echo "Run this from:  nix develop .#demo"
+    exit 1
 fi
+
+# ── Build gateway (cargo handles incremental — instant if unchanged) ──
+
+echo "── Building gateway (release) ──"
+(cd "$PROJECT_DIR" && cargo build --release)
+GATEWAY_BIN="$PROJECT_DIR/target/release/teleicu-gateway"
 
 # ── Prepare working directory ─────────────────────────────────────
 

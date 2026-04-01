@@ -71,12 +71,26 @@
         };
 
         # ── Demo launcher (nix run .#demo) ─────────────────────────
-        # Builds the gateway, then runs it behind Caddy with self-signed HTTPS.
-        packages.demo = pkgs.writeShellApplication {
+        # Runs the gateway behind Caddy with self-signed HTTPS.
+        # Prefers a local cargo-built binary to avoid slow Nix rebuilds;
+        # falls back to `nix build` only if no local binary exists.
+        packages.demo =
+          let nixBin = "${self.packages.${system}.default}/bin/teleicu-gateway";
+          in pkgs.writeShellApplication {
           name = "teleicu-gateway-demo";
           runtimeInputs = with pkgs; [ caddy curl coreutils gnused ];
           text = ''
-            GATEWAY_BIN="${self.packages.${system}.default}/bin/teleicu-gateway"
+            # Prefer local cargo-built binary (instant if unchanged),
+            # fall back to the Nix-built one (hermetic but slower).
+            LOCAL_BIN="./target/release/teleicu-gateway"
+            NIX_BIN="${nixBin}"
+            if [ -x "$LOCAL_BIN" ]; then
+              GATEWAY_BIN="$LOCAL_BIN"
+              echo "Using local binary: $LOCAL_BIN"
+            else
+              GATEWAY_BIN="$NIX_BIN"
+              echo "No local binary found — using Nix-built binary"
+            fi
             export PATH="${pkgs.lib.makeBinPath (with pkgs; [ caddy curl coreutils gnused ])}:$PATH"
 
             DEMO_PORT="''${DEMO_PORT:-8443}"
