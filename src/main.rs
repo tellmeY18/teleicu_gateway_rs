@@ -244,7 +244,7 @@ async fn proxy_to_rtsptoweb(
     req: axum::extract::Request,
     rtsptoweb_base: String,
 ) -> Result<axum::response::Response, crate::error::AppError> {
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!(
         "{}{}{}",
