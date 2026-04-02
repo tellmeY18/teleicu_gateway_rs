@@ -54,6 +54,14 @@ pub async fn get_video_feed_token(
     State(state): State<AppState>,
     Json(req): Json<VideoStreamRequest>,
 ) -> Result<Json<Value>, AppError> {
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "📹 Video stream token requested - stream: {}, ip: {}, duration: {:?}",
+        req.stream,
+        req.ip,
+        req._duration
+    );
+
     let duration_mins = parse_duration_mins(&req._duration);
     let exp_secs = duration_mins * 60;
 
@@ -66,7 +74,22 @@ pub async fn get_video_feed_token(
             }),
             exp_secs,
         )
-        .map_err(|e| AppError::Internal(e))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::stream",
+                "❌ Failed to sign video token for stream {}: {}",
+                req.stream,
+                e
+            );
+            AppError::Internal(e)
+        })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "✅ Video stream token issued - stream: {}, expires in: {}s",
+        req.stream,
+        exp_secs
+    );
 
     Ok(Json(json!({ "token": token })))
 }
@@ -77,6 +100,14 @@ pub async fn get_vitals_token(
     State(state): State<AppState>,
     Json(req): Json<VitalsTokenRequest>,
 ) -> Result<Json<Value>, AppError> {
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "💓 Vitals stream token requested - asset_id: {}, ip: {}, duration: {:?}",
+        req.asset_id,
+        req.ip,
+        req._duration
+    );
+
     let duration_mins = parse_duration_mins(&req._duration);
     let exp_secs = duration_mins * 60;
 
@@ -89,7 +120,22 @@ pub async fn get_vitals_token(
             }),
             exp_secs,
         )
-        .map_err(|e| AppError::Internal(e))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::stream",
+                "❌ Failed to sign vitals token for asset {}: {}",
+                req.asset_id,
+                e
+            );
+            AppError::Internal(e)
+        })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "✅ Vitals stream token issued - asset_id: {}, expires in: {}s",
+        req.asset_id,
+        exp_secs
+    );
 
     Ok(Json(json!({ "token": token })))
 }
@@ -99,9 +145,21 @@ pub async fn verify_token(
     State(state): State<AppState>,
     Json(req): Json<VerifyTokenRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
+    tracing::debug!(
+        target: "teleicu_gateway::stream",
+        "🔐 Token verification requested - ip: {:?}, stream: {:?}",
+        req.ip,
+        req.stream
+    );
+
     let claims = match state.own_keypair.verify_jwt(&req.token) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!(
+                target: "teleicu_gateway::stream",
+                "❌ Token verification failed - invalid signature: {}",
+                e
+            );
             return Ok((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "status": "0" })),
@@ -123,8 +181,21 @@ pub async fn verify_token(
         .unwrap_or(true);
 
     if ip_match || stream_match {
+        tracing::info!(
+            target: "teleicu_gateway::stream",
+            "✅ Token verified successfully - ip: {:?}, stream: {:?}",
+            req.ip,
+            req.stream
+        );
         Ok((StatusCode::OK, Json(json!({ "status": "1" }))))
     } else {
+        tracing::warn!(
+            target: "teleicu_gateway::stream",
+            "❌ Token verification failed - claims mismatch. Expected ip: {:?}, stream: {:?}. Token claims: {:?}",
+            req.ip,
+            req.stream,
+            extra
+        );
         Ok((
             StatusCode::UNAUTHORIZED,
             Json(json!({ "status": "0" })),
@@ -137,28 +208,69 @@ pub async fn exchange_token(
     State(state): State<AppState>,
     Json(req): Json<ExchangeTokenRequest>,
 ) -> Result<Json<Value>, AppError> {
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "🔄 Token exchange requested - verifying with CARE"
+    );
+
     // Forward to CARE to verify the token
     let url = format!(
         "{}/api/v1/auth/token/verify/",
         state.settings.care_api.trim_end_matches('/')
     );
+
+    tracing::debug!(
+        target: "teleicu_gateway::stream",
+        "Calling CARE token verification endpoint: {}",
+        url
+    );
+
     let resp = state
         .http
         .post(&url)
         .json(&json!({ "token": req.token }))
         .send()
         .await
-        .map_err(|e| AppError::CareApi(format!("token verify failed: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::stream",
+                "❌ CARE token verification request failed: {}",
+                e
+            );
+            AppError::CareApi(format!("token verify failed: {e}"))
+        })?;
 
     if !resp.status().is_success() {
+        tracing::warn!(
+            target: "teleicu_gateway::stream",
+            "❌ CARE rejected token - status: {}",
+            resp.status()
+        );
         return Err(AppError::Unauthorized);
     }
+
+    tracing::debug!(
+        target: "teleicu_gateway::stream",
+        "✅ CARE validated token successfully"
+    );
 
     // Issue a gateway JWT (20 min expiry)
     let token = state
         .own_keypair
         .sign_jwt(json!({}), 20 * 60)
-        .map_err(|e| AppError::Internal(e))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::stream",
+                "❌ Failed to sign gateway token: {}",
+                e
+            );
+            AppError::Internal(e)
+        })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::stream",
+        "✅ Gateway token issued (20 min expiry)"
+    );
 
     Ok(Json(json!({ "token": token })))
 }

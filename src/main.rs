@@ -18,7 +18,8 @@ use axum::Router;
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::auth::outbound::OwnKeypair;
 use crate::config::Settings;
@@ -34,12 +35,15 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => eprintln!("[boot] No .env file loaded: {e}"),
     }
 
-    // Initialize tracing
+    // Initialize tracing with verbose output
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,teleicu_gateway=debug".into()),
+                .unwrap_or_else(|_| "info,teleicu_gateway=debug,tower_http=debug,axum=debug".into()),
         )
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_line_number(true)
         .init();
 
     // Load settings
@@ -161,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
     tasks::spawn_all(state.clone());
 
     // Build router
+    tracing::info!("🔧 Building application router with proxy to {}", settings.rtsptoweb_url);
     let rtsptoweb_url = settings.rtsptoweb_url.clone();
     let app = Router::new()
         // No auth
@@ -204,10 +209,26 @@ async fn main() -> anyhow::Result<()> {
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(
+                    DefaultMakeSpan::new()
+                        .level(Level::INFO)
+                        .include_headers(true)
+                )
+                .on_request(
+                    DefaultOnRequest::new().level(Level::INFO)
+                )
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .include_headers(true)
+                )
+        )
         .with_state(state);
 
-    tracing::info!("Listening on http://{bind_addr}");
+    tracing::info!("🚀 Server starting - listening on http://{bind_addr}");
+    tracing::info!("📡 Ready to accept requests from CARE and devices");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(
         listener,
@@ -234,9 +255,46 @@ async fn proxy_to_rtsptoweb(
 
     let method = req.method().clone();
     let headers = req.headers().clone();
+
+    tracing::info!(
+        target: "teleicu_gateway::proxy",
+        "🔄 Proxying {} {} to RTSPtoWeb: {}",
+        method,
+        path,
+        url
+    );
+
+    // Log request headers for debugging
+    for (key, value) in headers.iter() {
+        if let Ok(val_str) = value.to_str() {
+            tracing::debug!(
+                target: "teleicu_gateway::proxy",
+                "  Request header: {}: {}",
+                key,
+                val_str
+            );
+        }
+    }
+
     let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
         .await
-        .map_err(|e| crate::error::AppError::Internal(anyhow::anyhow!("body read error: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::proxy",
+                "❌ Failed to read request body for {}: {}",
+                path,
+                e
+            );
+            crate::error::AppError::Internal(anyhow::anyhow!("body read error: {e}"))
+        })?;
+
+    if !body.is_empty() {
+        tracing::debug!(
+            target: "teleicu_gateway::proxy",
+            "  Request body size: {} bytes",
+            body.len()
+        );
+    }
 
     let client = reqwest::Client::new();
     let mut upstream_req = client.request(method, &url);
@@ -249,11 +307,37 @@ async fn proxy_to_rtsptoweb(
     upstream_req = upstream_req.body(body);
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
+        tracing::error!(
+            target: "teleicu_gateway::proxy",
+            "❌ RTSPtoWeb request failed for {} - Error: {}",
+            url,
+            e
+        );
         crate::error::AppError::Internal(anyhow::anyhow!("proxy error: {e}"))
     })?;
 
     let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+
+    tracing::info!(
+        target: "teleicu_gateway::proxy",
+        "✅ RTSPtoWeb responded to {} - Status: {}",
+        path,
+        status
+    );
+
+    // Log response headers for debugging
+    for (key, value) in upstream_resp.headers().iter() {
+        if let Ok(val_str) = value.to_str() {
+            tracing::debug!(
+                target: "teleicu_gateway::proxy",
+                "  Response header: {}: {}",
+                key,
+                val_str
+            );
+        }
+    }
+
     let mut builder = axum::response::Response::builder().status(status);
 
     for (key, value) in upstream_resp.headers().iter() {
@@ -263,9 +347,31 @@ async fn proxy_to_rtsptoweb(
     let resp_body = upstream_resp
         .bytes()
         .await
-        .map_err(|e| crate::error::AppError::Internal(anyhow::anyhow!("proxy body error: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::proxy",
+                "❌ Failed to read response body from RTSPtoWeb: {}",
+                e
+            );
+            crate::error::AppError::Internal(anyhow::anyhow!("proxy body error: {e}"))
+        })?;
+
+    if !resp_body.is_empty() {
+        tracing::debug!(
+            target: "teleicu_gateway::proxy",
+            "  Response body size: {} bytes",
+            resp_body.len()
+        );
+    }
 
     builder
         .body(axum::body::Body::from(resp_body))
-        .map_err(|e| crate::error::AppError::Internal(anyhow::anyhow!("response build error: {e}")))
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::proxy",
+                "❌ Failed to build response: {}",
+                e
+            );
+            crate::error::AppError::Internal(anyhow::anyhow!("response build error: {e}"))
+        })
 }

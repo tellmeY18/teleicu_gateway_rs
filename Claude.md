@@ -838,6 +838,238 @@ For `/stream` specifically: pipe response body bytes as a stream without bufferi
 
 ---
 
+## Logging & Observability
+
+The gateway uses the `tracing` crate for structured logging with comprehensive instrumentation across all subsystems. All requests from CARE and operations are logged to stdout for debugging and monitoring.
+
+### Configuration
+
+Logging is initialized at startup in `main.rs`:
+
+```rust
+tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,teleicu_gateway=debug,tower_http=debug,axum=debug".into()),
+    )
+    .with_target(true)
+    .with_thread_ids(true)
+    .with_line_number(true)
+    .init();
+```
+
+**Default levels:**
+- `info` — global default for all crates
+- `debug` — `teleicu_gateway` (our code), `tower_http` (HTTP middleware), `axum` (web framework)
+
+**Customization via `RUST_LOG` environment variable:**
+```sh
+# Very verbose (includes trace-level ONVIF SOAP)
+RUST_LOG=trace ./teleicu-gateway
+
+# Only errors and warnings
+RUST_LOG=warn,teleicu_gateway=info ./teleicu-gateway
+
+# Debug specific modules
+RUST_LOG=info,teleicu_gateway::camera=trace,teleicu_gateway::stream=debug ./teleicu-gateway
+```
+
+### HTTP Request/Response Logging
+
+Tower's `TraceLayer` logs every HTTP request and response:
+
+```rust
+TraceLayer::new_for_http()
+    .make_span_with(
+        DefaultMakeSpan::new()
+            .level(Level::INFO)
+            .include_headers(true)
+    )
+    .on_request(DefaultOnRequest::new().level(Level::INFO))
+    .on_response(
+        DefaultOnResponse::new()
+            .level(Level::INFO)
+            .include_headers(true)
+    )
+```
+
+**Example output:**
+```
+INFO tower_http::trace::on_request: started processing request method=POST uri=/getToken/videoFeed
+INFO tower_http::trace::on_response: finished processing request latency=45ms status=200
+```
+
+### Subsystem-Specific Logging
+
+All log messages use `target:` to identify their source module for easy filtering.
+
+#### 1. Proxy to RTSPtoWeb (`teleicu_gateway::proxy`)
+
+Every proxied request logs:
+- Request method, path, and full URL to RTSPtoWeb
+- Request/response headers (at `debug` level)
+- Request/response body sizes
+- Upstream response status
+- Errors with full context
+
+**Example:**
+```
+INFO  teleicu_gateway::proxy: 🔄 Proxying GET /stream to RTSPtoWeb: http://localhost:8080/stream?uuid=81087826-1e10-4a50-a4ec-ab0064d34745
+DEBUG teleicu_gateway::proxy:   Request header: authorization: Bearer eyJ...
+INFO  teleicu_gateway::proxy: ✅ RTSPtoWeb responded to /stream - Status: 200 OK
+```
+
+#### 2. Stream Token API (`teleicu_gateway::stream`)
+
+Logs token generation and verification:
+- `/getToken/videoFeed` — video stream token requests
+- `/getToken/vitals` — vitals stream token requests
+- `/verifyToken` — token validation from RTSPtoWeb
+- `/verify_token` — CARE token exchange
+
+**Example:**
+```
+INFO  teleicu_gateway::stream: 📹 Video stream token requested - stream: 81087826-1e10-4a50-a4ec-ab0064d34745, ip: 192.168.68.65, duration: Some("10")
+INFO  teleicu_gateway::stream: ✅ Video stream token issued - stream: 81087826-1e10-4a50-a4ec-ab0064d34745, expires in: 600s
+```
+
+```
+DEBUG teleicu_gateway::stream: 🔐 Token verification requested - ip: Some("192.168.68.65"), stream: Some("81087826...")
+INFO  teleicu_gateway::stream: ✅ Token verified successfully - ip: Some("192.168.68.65"), stream: Some("81087826...")
+```
+
+**Errors:**
+```
+WARN  teleicu_gateway::stream: ❌ Token verification failed - invalid signature: InvalidSignature
+WARN  teleicu_gateway::stream: ❌ Token verification failed - claims mismatch. Expected ip: Some("192.168.68.66"), stream: Some("uuid2"). Token claims: {"ip": "192.168.68.65", "stream": "uuid1"}
+```
+
+#### 3. Camera Control (`teleicu_gateway::camera`)
+
+Logs all ONVIF operations:
+- PTZ moves (absolute, relative, preset)
+- Camera lock acquisition/release
+- Preset management
+- Status queries
+
+**Example:**
+```
+INFO  teleicu_gateway::camera: 📷 POST /cameras/absoluteMove - hostname: 192.168.68.65, x: 0.5, y: -0.3, zoom: 0.0
+DEBUG teleicu_gateway::camera: Acquiring camera lock for 192.168.68.65
+DEBUG teleicu_gateway::camera: Camera lock acquired for 192.168.68.65
+DEBUG teleicu_gateway::camera: Waiting for camera 192.168.68.65 to reach idle state
+INFO  teleicu_gateway::camera: ✅ Absolute move completed for 192.168.68.65 to position (0.5, -0.3, 0.0)
+```
+
+```
+INFO  teleicu_gateway::camera: 📷 POST /cameras/gotoPreset - hostname: 192.168.68.66, preset_index: 2
+DEBUG teleicu_gateway::camera: Moving camera 192.168.68.66 to preset: Ventilator View (token: preset_2)
+INFO  teleicu_gateway::camera: ✅ Camera 192.168.68.66 moved to preset #2 (Ventilator View)
+```
+
+#### 4. Authentication (`teleicu_gateway::auth`)
+
+Logs CARE token validation:
+- Authorization header extraction
+- JWKS cache hits/misses
+- Token validation attempts
+- Key rotation tracking
+
+**Example:**
+```
+DEBUG teleicu_gateway::auth: 🔐 Validating Care_Bearer token for POST /getToken/videoFeed
+DEBUG teleicu_gateway::auth: Extracted Care_Bearer token (length: 324)
+DEBUG teleicu_gateway::auth: Fetching CARE JWKS from cache or API
+DEBUG teleicu_gateway::auth: ✅ Using cached JWKS (age: 142s, ttl: 300s)
+DEBUG teleicu_gateway::auth: Retrieved JWKS with 2 keys
+TRACE teleicu_gateway::auth: Trying JWKS key #0 (kid: Some("key-2024-01"))
+INFO  teleicu_gateway::auth: ✅ Care_Bearer token validated successfully - sub: Some("user-123")
+```
+
+**JWKS fetch:**
+```
+DEBUG teleicu_gateway::auth: JWKS cache expired (age: 305s, ttl: 300s) - fetching fresh
+INFO  teleicu_gateway::auth: 📡 Fetching JWKS from CARE API: https://care.example.com/api/gateway_device/jwks.json/
+INFO  teleicu_gateway::auth: ✅ JWKS fetched successfully - 2 keys
+DEBUG teleicu_gateway::auth: JWKS cache updated
+```
+
+**Errors:**
+```
+WARN  teleicu_gateway::auth: ❌ Missing Authorization header
+WARN  teleicu_gateway::auth: ❌ Authorization header does not start with 'Care_Bearer '
+WARN  teleicu_gateway::auth: ❌ Token validation failed - no valid key found in JWKS
+ERROR teleicu_gateway::auth: ❌ Failed to fetch JWKS from https://care.example.com/api/gateway_device/jwks.json/: connection refused
+```
+
+### Emoji Guide
+
+For quick visual scanning of logs:
+- 🔄 — Proxying to RTSPtoWeb
+- 📹 — Video stream token
+- 💓 — Vitals stream token
+- 🔐 — Authentication/token verification
+- 📷 — Camera control operation
+- 📡 — Network request (outbound to CARE)
+- ✅ — Success
+- ❌ — Error/failure
+- 🚀 — Server startup
+- 🔧 — Configuration/setup
+
+### Debugging Camera Feed Issues
+
+When camera feeds aren't working, check logs in this order:
+
+**1. Server startup:**
+```
+INFO  Starting TeleICU Gateway v0.1.0 on 0.0.0.0:8090
+INFO    RTSPTOWEB_URL  = http://localhost:8080
+INFO  🔧 Building application router with proxy to http://localhost:8080
+INFO  🚀 Server starting - listening on 0.0.0.0:8090
+INFO  📡 Ready to accept requests from CARE and devices
+```
+
+**2. Stream token request from CARE:**
+```
+INFO  tower_http::trace::on_request: started processing request method=POST uri=/getToken/videoFeed
+DEBUG teleicu_gateway::auth: 🔐 Validating Care_Bearer token for POST /getToken/videoFeed
+INFO  teleicu_gateway::auth: ✅ Care_Bearer token validated successfully
+INFO  teleicu_gateway::stream: 📹 Video stream token requested - stream: 81087826..., ip: 192.168.68.65
+INFO  teleicu_gateway::stream: ✅ Video stream token issued - stream: 81087826..., expires in: 600s
+INFO  tower_http::trace::on_response: finished processing request latency=23ms status=200
+```
+
+**3. Stream request via proxy:**
+```
+INFO  teleicu_gateway::proxy: 🔄 Proxying GET /stream to RTSPtoWeb: http://localhost:8080/stream?uuid=81087826-1e10-4a50-a4ec-ab0064d34745&token=eyJ...
+INFO  teleicu_gateway::proxy: ✅ RTSPtoWeb responded to /stream - Status: 200 OK
+```
+
+**4. Token verification callback from RTSPtoWeb:**
+```
+INFO  tower_http::trace::on_request: started processing request method=POST uri=/verifyToken
+DEBUG teleicu_gateway::stream: 🔐 Token verification requested - stream: Some("81087826...")
+INFO  teleicu_gateway::stream: ✅ Token verified successfully
+```
+
+**Common failure patterns:**
+
+- **No proxy logs** → CARE never requested stream, or routing issue
+- **401 on /getToken/videoFeed** → CARE token invalid, check JWKS
+- **Proxy connection refused** → RTSPtoWeb not running on expected port
+- **No /verifyToken callback** → RTSPtoWeb not configured with `token.backend`
+- **Token verification fails** → UUID mismatch or token expired
+
+### Log Levels Summary
+
+| Level | What's Logged |
+|---|---|
+| `ERROR` | Fatal errors, CARE API failures, proxy failures |
+| `WARN` | Authentication failures, invalid tokens, deprecated usage |
+| `INFO` | All requests, responses, token generation, camera operations |
+| `DEBUG` | Headers, cache hits/misses, lock acquisition, intermediate steps |
+| `TRACE` | JWKS key attempts, SOAP envelopes (very verbose) |
+
 ## Startup Sequence (`main.rs`)
 
 The binary is zero-config-friendly — it creates missing directories and the SQLite file on first run. The boot sequence is:

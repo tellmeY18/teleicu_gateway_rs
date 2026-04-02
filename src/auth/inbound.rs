@@ -33,15 +33,45 @@ impl FromRequestParts<AppState> for CareAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        tracing::debug!(
+            target: "teleicu_gateway::auth",
+            "🔐 Validating Care_Bearer token for {} {}",
+            parts.method,
+            parts.uri.path()
+        );
+
         let header = parts
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or_else(|| {
+                tracing::warn!(
+                    target: "teleicu_gateway::auth",
+                    "❌ Missing Authorization header"
+                );
+                AppError::Unauthorized
+            })?;
 
         let token = header
             .strip_prefix("Care_Bearer ")
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or_else(|| {
+                tracing::warn!(
+                    target: "teleicu_gateway::auth",
+                    "❌ Authorization header does not start with 'Care_Bearer '"
+                );
+                AppError::Unauthorized
+            })?;
+
+        tracing::debug!(
+            target: "teleicu_gateway::auth",
+            "Extracted Care_Bearer token (length: {})",
+            token.len()
+        );
+
+        tracing::debug!(
+            target: "teleicu_gateway::auth",
+            "Fetching CARE JWKS from cache or API"
+        );
 
         let jwks = fetch_or_cached_jwks(
             &state.http,
@@ -50,11 +80,32 @@ impl FromRequestParts<AppState> for CareAuth {
         )
         .await?;
 
+        tracing::debug!(
+            target: "teleicu_gateway::auth",
+            "Retrieved JWKS with {} keys",
+            jwks.keys.len()
+        );
+
         // Try each key in the keyset
-        for jwk in &jwks.keys {
+        for (idx, jwk) in jwks.keys.iter().enumerate() {
+            tracing::trace!(
+                target: "teleicu_gateway::auth",
+                "Trying JWKS key #{} (kid: {:?})",
+                idx,
+                jwk.common.key_id
+            );
+
             let decoding_key = match DecodingKey::from_jwk(jwk) {
                 Ok(k) => k,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::trace!(
+                        target: "teleicu_gateway::auth",
+                        "Failed to create decoding key from JWK #{}: {}",
+                        idx,
+                        e
+                    );
+                    continue;
+                }
             };
             let mut validation = Validation::new(Algorithm::RS256);
             validation.validate_exp = true;
@@ -62,11 +113,30 @@ impl FromRequestParts<AppState> for CareAuth {
             validation.set_required_spec_claims(&["exp"]);
 
             match decode::<ValidatedClaims>(token, &decoding_key, &validation) {
-                Ok(data) => return Ok(CareAuth(data.claims)),
-                Err(_) => continue,
+                Ok(data) => {
+                    tracing::info!(
+                        target: "teleicu_gateway::auth",
+                        "✅ Care_Bearer token validated successfully - sub: {:?}",
+                        data.claims.sub
+                    );
+                    return Ok(CareAuth(data.claims));
+                }
+                Err(e) => {
+                    tracing::trace!(
+                        target: "teleicu_gateway::auth",
+                        "Key #{} failed to validate token: {}",
+                        idx,
+                        e
+                    );
+                    continue;
+                }
             }
         }
 
+        tracing::warn!(
+            target: "teleicu_gateway::auth",
+            "❌ Token validation failed - no valid key found in JWKS"
+        );
         Err(AppError::Unauthorized)
     }
 }
@@ -81,9 +151,28 @@ async fn fetch_or_cached_jwks(
     {
         let guard = cache.read().await;
         if let Some(cached) = guard.as_ref() {
-            if cached.fetched_at.elapsed().as_secs() < JWKS_CACHE_TTL_SECS {
+            let age_secs = cached.fetched_at.elapsed().as_secs();
+            if age_secs < JWKS_CACHE_TTL_SECS {
+                tracing::debug!(
+                    target: "teleicu_gateway::auth",
+                    "✅ Using cached JWKS (age: {}s, ttl: {}s)",
+                    age_secs,
+                    JWKS_CACHE_TTL_SECS
+                );
                 return Ok(cached.keys.clone());
+            } else {
+                tracing::debug!(
+                    target: "teleicu_gateway::auth",
+                    "JWKS cache expired (age: {}s, ttl: {}s) - fetching fresh",
+                    age_secs,
+                    JWKS_CACHE_TTL_SECS
+                );
             }
+        } else {
+            tracing::debug!(
+                target: "teleicu_gateway::auth",
+                "JWKS cache empty - fetching from CARE API"
+            );
         }
     }
 
@@ -92,13 +181,33 @@ async fn fetch_or_cached_jwks(
         "{}/api/gateway_device/jwks.json/",
         care_api.trim_end_matches('/')
     );
+
+    tracing::info!(
+        target: "teleicu_gateway::auth",
+        "📡 Fetching JWKS from CARE API: {}",
+        url
+    );
+
     let resp = http
         .get(&url)
         .send()
         .await
-        .map_err(|e| AppError::CareApi(format!("failed to fetch JWKS: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::auth",
+                "❌ Failed to fetch JWKS from {}: {}",
+                url,
+                e
+            );
+            AppError::CareApi(format!("failed to fetch JWKS: {e}"))
+        })?;
 
     if !resp.status().is_success() {
+        tracing::error!(
+            target: "teleicu_gateway::auth",
+            "❌ CARE API returned error status for JWKS: {}",
+            resp.status()
+        );
         return Err(AppError::CareApi(format!(
             "JWKS fetch returned {}",
             resp.status()
@@ -108,7 +217,20 @@ async fn fetch_or_cached_jwks(
     let jwks: jsonwebtoken::jwk::JwkSet = resp
         .json()
         .await
-        .map_err(|e| AppError::CareApi(format!("failed to parse JWKS: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "teleicu_gateway::auth",
+                "❌ Failed to parse JWKS JSON: {}",
+                e
+            );
+            AppError::CareApi(format!("failed to parse JWKS: {e}"))
+        })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::auth",
+        "✅ JWKS fetched successfully - {} keys",
+        jwks.keys.len()
+    );
 
     // Update cache
     {
@@ -117,6 +239,10 @@ async fn fetch_or_cached_jwks(
             keys: jwks.clone(),
             fetched_at: Instant::now(),
         });
+        tracing::debug!(
+            target: "teleicu_gateway::auth",
+            "JWKS cache updated"
+        );
     }
 
     Ok(jwks)

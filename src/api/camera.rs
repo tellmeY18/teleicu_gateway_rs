@@ -53,7 +53,13 @@ pub async fn get_presets(
     State(state): State<AppState>,
     Query(params): Query<CameraParams>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("get_presets for {}", params.hostname);
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 GET /cameras/presets - hostname: {}, port: {}, user: {}",
+        params.hostname,
+        params.port,
+        params.username
+    );
     let client = make_client(&state, &params.hostname, params.port, &params.username, &params.password);
     let profiles = client.get_profiles().await?;
     let profile_token = profiles
@@ -70,6 +76,13 @@ pub async fn get_presets(
         .map(|(i, p)| (p.name.clone(), json!(i)))
         .collect();
 
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Presets retrieved for {} - count: {}",
+        params.hostname,
+        presets.len()
+    );
+
     Ok(Json(json!({ "presets": preset_map })))
 }
 
@@ -79,7 +92,12 @@ pub async fn get_camera_status(
     State(state): State<AppState>,
     Query(params): Query<CameraParams>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("get_camera_status for {}", params.hostname);
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 GET /cameras/status - hostname: {}, port: {}",
+        params.hostname,
+        params.port
+    );
     let client = make_client(&state, &params.hostname, params.port, &params.username, &params.password);
     let profiles = client.get_profiles().await?;
     let profile_token = profiles
@@ -88,6 +106,13 @@ pub async fn get_camera_status(
         .ok_or_else(|| AppError::Onvif("no profiles found".into()))?;
 
     let status = client.get_status(profile_token).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Camera status retrieved for {}",
+        params.hostname
+    );
+
     Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
@@ -97,8 +122,28 @@ pub async fn absolute_move(
     State(state): State<AppState>,
     Json(req): Json<CameraMoveRequest>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("absolute_move for {}", req.hostname);
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 POST /cameras/absoluteMove - hostname: {}, x: {}, y: {}, zoom: {}",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom
+    );
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Acquiring camera lock for {}",
+        req.hostname
+    );
+
     let _lock = state.camera_locks.try_lock(&req.hostname).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Camera lock acquired for {}",
+        req.hostname
+    );
 
     let client = make_client(&state, &req.hostname, req.port, &req.username, &req.password);
     let profiles = client.get_profiles().await?;
@@ -108,7 +153,23 @@ pub async fn absolute_move(
         .ok_or_else(|| AppError::Onvif("no profiles found".into()))?;
 
     client.absolute_move(profile_token, req.x, req.y, req.zoom).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Waiting for camera {} to reach idle state",
+        req.hostname
+    );
+
     client.wait_for_idle(profile_token, state.settings.camera_lock_timeout_secs).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Absolute move completed for {} to position ({}, {}, {})",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom
+    );
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -119,8 +180,28 @@ pub async fn relative_move(
     State(state): State<AppState>,
     Json(req): Json<CameraMoveRequest>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("relative_move for {}", req.hostname);
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 POST /cameras/relativeMove - hostname: {}, dx: {}, dy: {}, dzoom: {}",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom
+    );
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Acquiring camera lock for {}",
+        req.hostname
+    );
+
     let _lock = state.camera_locks.try_lock(&req.hostname).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Camera lock acquired for {}",
+        req.hostname
+    );
 
     let client = make_client(&state, &req.hostname, req.port, &req.username, &req.password);
     let profiles = client.get_profiles().await?;
@@ -130,7 +211,23 @@ pub async fn relative_move(
         .ok_or_else(|| AppError::Onvif("no profiles found".into()))?;
 
     client.relative_move(profile_token, req.x, req.y, req.zoom).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Waiting for camera {} to reach idle state",
+        req.hostname
+    );
+
     client.wait_for_idle(profile_token, state.settings.camera_lock_timeout_secs).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Relative move completed for {} by delta ({}, {}, {})",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom
+    );
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -141,8 +238,28 @@ pub async fn snapshot_at_location(
     State(state): State<AppState>,
     Json(req): Json<CameraMoveRequest>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("snapshot_at_location for {}", req.hostname);
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 POST /cameras/snapshotAtLocation - hostname: {}, x: {}, y: {}, zoom: {}",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom
+    );
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Acquiring camera lock for {}",
+        req.hostname
+    );
+
     let _lock = state.camera_locks.try_lock(&req.hostname).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Camera lock acquired for {}",
+        req.hostname
+    );
 
     let client = make_client(&state, &req.hostname, req.port, &req.username, &req.password);
     let profiles = client.get_profiles().await?;
@@ -152,9 +269,27 @@ pub async fn snapshot_at_location(
         .ok_or_else(|| AppError::Onvif("no profiles found".into()))?;
 
     client.absolute_move(profile_token, req.x, req.y, req.zoom).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Waiting for camera {} to reach idle state before snapshot",
+        req.hostname
+    );
+
     client.wait_for_idle(profile_token, state.settings.camera_lock_timeout_secs).await?;
 
     let uri = client.get_snapshot_uri(profile_token).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Snapshot URI retrieved for {} at position ({}, {}, {}): {}",
+        req.hostname,
+        req.x,
+        req.y,
+        req.zoom,
+        uri
+    );
+
     Ok(Json(json!({ "status": "ok", "uri": uri })))
 }
 
@@ -164,12 +299,30 @@ pub async fn goto_preset(
     State(state): State<AppState>,
     Json(req): Json<CameraPresetRequest>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("goto_preset for {}", req.hostname);
-    let _lock = state.camera_locks.try_lock(&req.hostname).await?;
-
     let preset_index = req.preset.ok_or_else(|| {
         AppError::Onvif("preset index is required".into())
     })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 POST /cameras/gotoPreset - hostname: {}, preset_index: {}",
+        req.hostname,
+        preset_index
+    );
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Acquiring camera lock for {}",
+        req.hostname
+    );
+
+    let _lock = state.camera_locks.try_lock(&req.hostname).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Camera lock acquired for {}",
+        req.hostname
+    );
 
     let client = make_client(&state, &req.hostname, req.port, &req.username, &req.password);
     let profiles = client.get_profiles().await?;
@@ -181,8 +334,31 @@ pub async fn goto_preset(
     let presets = client.get_presets(profile_token).await?;
     let preset = presets.get(preset_index as usize).ok_or(AppError::NotFound)?;
 
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Moving camera {} to preset: {} (token: {})",
+        req.hostname,
+        preset.name,
+        preset.token
+    );
+
     client.goto_preset(profile_token, &preset.token).await?;
+
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "Waiting for camera {} to reach idle state",
+        req.hostname
+    );
+
     client.wait_for_idle(profile_token, state.settings.camera_lock_timeout_secs).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Camera {} moved to preset #{} ({})",
+        req.hostname,
+        preset_index,
+        preset.name
+    );
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -193,11 +369,16 @@ pub async fn set_preset(
     State(state): State<AppState>,
     Json(req): Json<CameraPresetRequest>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::trace!("set_preset for {}", req.hostname);
-
     let preset_name = req.preset_name.as_deref().ok_or_else(|| {
         AppError::Onvif("preset_name is required".into())
     })?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "📷 POST /cameras/set_preset - hostname: {}, preset_name: {}",
+        req.hostname,
+        preset_name
+    );
 
     let client = make_client(&state, &req.hostname, req.port, &req.username, &req.password);
     let profiles = client.get_profiles().await?;
@@ -207,6 +388,14 @@ pub async fn set_preset(
         .ok_or_else(|| AppError::Onvif("no profiles found".into()))?;
 
     client.set_preset(profile_token, preset_name).await?;
+
+    tracing::info!(
+        target: "teleicu_gateway::camera",
+        "✅ Preset '{}' saved for camera {}",
+        preset_name,
+        req.hostname
+    );
+
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -215,6 +404,11 @@ pub async fn cameras_status_all(
     _auth: CareAuth,
     State(state): State<AppState>,
 ) -> Json<Value> {
+    tracing::debug!(
+        target: "teleicu_gateway::camera",
+        "📷 GET /cameras/status (all) - retrieving device statuses"
+    );
+
     let statuses = state.obs_store.get_device_statuses();
     Json(json!({
         "time": Utc::now().to_rfc3339(),
