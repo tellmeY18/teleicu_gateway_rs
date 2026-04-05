@@ -25,6 +25,7 @@ pub struct Position {
 /// PTZ move status.
 #[derive(Debug, Clone, Serialize)]
 pub struct MoveStatus {
+    #[serde(rename = "panTilt")]
     pub pan_tilt: String,
     pub zoom: String,
 }
@@ -33,6 +34,7 @@ pub struct MoveStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct PtzStatus {
     pub position: Position,
+    #[serde(rename = "moveStatus")]
     pub move_status: MoveStatus,
     pub error: Option<String>,
 }
