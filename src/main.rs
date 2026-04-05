@@ -305,7 +305,8 @@ async fn proxy_to_rtsptoweb(
         }
     }
 
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+    // Convert axum body to reqwest body for streaming
+    let body_stream = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -317,14 +318,6 @@ async fn proxy_to_rtsptoweb(
             crate::error::AppError::Internal(anyhow::anyhow!("body read error: {e}"))
         })?;
 
-    if !body.is_empty() {
-        tracing::debug!(
-            target: "teleicu_gateway::proxy",
-            "  Request body size: {} bytes",
-            body.len()
-        );
-    }
-
     let client = reqwest::Client::new();
     let mut upstream_req = client.request(method, &url);
     for (key, value) in headers.iter() {
@@ -333,7 +326,7 @@ async fn proxy_to_rtsptoweb(
         }
         upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
     }
-    upstream_req = upstream_req.body(body);
+    upstream_req = upstream_req.body(body_stream.to_vec());
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
         tracing::error!(
@@ -373,28 +366,12 @@ async fn proxy_to_rtsptoweb(
         builder = builder.header(key.as_str(), value.as_bytes());
     }
 
-    let resp_body = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "teleicu_gateway::proxy",
-                "❌ Failed to read response body from RTSPtoWeb: {}",
-                e
-            );
-            crate::error::AppError::Internal(anyhow::anyhow!("proxy body error: {e}"))
-        })?;
-
-    if !resp_body.is_empty() {
-        tracing::debug!(
-            target: "teleicu_gateway::proxy",
-            "  Response body size: {} bytes",
-            resp_body.len()
-        );
-    }
+    // Stream response body for HLS/WebSocket support
+    let resp_stream = upstream_resp.bytes_stream();
+    let body = axum::body::Body::from_stream(resp_stream);
 
     builder
-        .body(axum::body::Body::from(resp_body))
+        .body(body)
         .map_err(|e| {
             tracing::error!(
                 target: "teleicu_gateway::proxy",

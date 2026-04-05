@@ -1874,9 +1874,17 @@ The original Django deployment used Nginx to proxy `/stream` and other RTSPtoWeb
 The Rust proxy handler (`proxy_to_rtsptoweb` in `src/main.rs`) properly forwards:
 - WebSocket upgrade headers (`Upgrade`, `Connection`)
 - Query parameters (including stream tokens)
-- Request/response bodies
+- **Streaming response bodies** (using `bytes_stream()` instead of buffering)
 - All headers except `host`
 - Full URI path (e.g., `/stream/uuid/channel/0/hls/live/index.m3u8`)
+
+**Critical**: Response bodies are streamed using `axum::body::Body::from_stream()` to support:
+- WebSocket connections (requires unbuffered streaming)
+- HLS video segments (`.ts` files)
+- Live streaming without buffering delays
+- Large file transfers without memory exhaustion
+
+This matches the Nginx behavior where responses are proxied in real-time without buffering the entire response.
 
 **Original Nginx Config** (now internalized):
 ```nginx
