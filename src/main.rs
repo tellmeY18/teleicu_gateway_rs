@@ -197,18 +197,21 @@ async fn main() -> anyhow::Result<()> {
         // WebSocket
         .route("/observations/{ip_address}", get(ws::observations::ws_observations))
         .route("/logger", get(ws::logger::ws_logger))
-        // Reverse proxy to rtsptoweb
-        .route("/start", any(move |req: axum::extract::Request| proxy_to_rtsptoweb(req, rtsptoweb_url.clone())))
+        // Reverse proxy to rtsptoweb (must clone URL for each handler)
+        .route("/start", any({
+            let url = rtsptoweb_url.clone();
+            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+        }))
         .route("/stream", any({
-            let url = settings.rtsptoweb_url.clone();
+            let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
         .route("/list", any({
-            let url = settings.rtsptoweb_url.clone();
+            let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
         .route("/stop", any({
-            let url = settings.rtsptoweb_url.clone();
+            let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
         .layer(CorsLayer::permissive())
