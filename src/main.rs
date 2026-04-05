@@ -209,7 +209,15 @@ async fn main() -> anyhow::Result<()> {
             let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
+        .route("/start/*path", any({
+            let url = rtsptoweb_url.clone();
+            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+        }))
         .route("/stream", any({
+            let url = rtsptoweb_url.clone();
+            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+        }))
+        .route("/stream/*path", any({
             let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
@@ -217,7 +225,15 @@ async fn main() -> anyhow::Result<()> {
             let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))
+        .route("/list/*path", any({
+            let url = rtsptoweb_url.clone();
+            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+        }))
         .route("/stop", any({
+            let url = rtsptoweb_url.clone();
+            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+        }))
+        .route("/stop/*path", any({
             let url = rtsptoweb_url.clone();
             move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
         }))

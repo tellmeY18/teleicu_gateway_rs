@@ -1096,8 +1096,15 @@ When debugging startup failures: check the cwd (the binary logs it), whether `DA
 **Nix Dev Shell** (recommended for development):
 ```bash
 nix develop                    # enter dev shell with all deps
+
+# Build with timestamp for version tracking
+BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) cargo build --release
+
+# Or just build without timestamp
 cargo build --release          # binary at target/release/teleicu-gateway
-cargo run                      # run with hot reload during development
+
+# Run with hot reload during development
+cargo run
 ```
 
 **Nix Build** (hermetic, production binary):
@@ -1107,7 +1114,22 @@ nix build                      # production binary at result/bin/teleicu-gateway
 
 **Cargo** (only if all system deps are available):
 ```bash
+# Build with timestamp
+BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) cargo build --release
+
+# Or without timestamp
 cargo build --release          # binary at target/release/teleicu-gateway
+```
+
+**Verify Running Version**:
+```bash
+# Check build timestamp in logs (shown at startup)
+# or via HTTP:
+curl http://localhost:8000/healthz
+# Returns: {"server":"ok","database":"ok","build_timestamp":"2024-04-05T16:30:00Z"}
+
+curl http://localhost:8000/health/status
+# Returns full version info including build_timestamp
 ```
 
 On macOS, always use `nix develop` for building — the project depends on `libiconv` and `sqlite` which the flake's dev shell provides. Running `cargo build` outside the shell will fail with linker errors.
@@ -1835,10 +1857,10 @@ Fixed proxy route registration for RTSPtoWeb to ensure consistent URL cloning fo
 | POST | `/getToken/vitals` | Get vitals token | Care_Bearer | Body: `{asset_id, ip, _duration}` |
 | POST | `/verifyToken` | Verify token | None | Body: `{token, ip?, stream?}` |
 | POST | `/verify_token` | Exchange/verify token | None | Body: `{token}` |
-| ANY | `/stream` | Stream WebRTC/HLS | Token | Query: `token=<jwt>` (proxied to RTSPtoWeb) |
-| ANY | `/start` | Start stream | Token | (proxied to RTSPtoWeb) |
-| ANY | `/list` | List streams | Token | (proxied to RTSPtoWeb) |
-| ANY | `/stop` | Stop stream | Token | (proxied to RTSPtoWeb) |
+| ANY | `/stream`, `/stream/*` | Stream WebRTC/HLS | Token | All paths under /stream (proxied to RTSPtoWeb) |
+| ANY | `/start`, `/start/*` | Start stream | Token | All paths under /start (proxied to RTSPtoWeb) |
+| ANY | `/list`, `/list/*` | List streams | Token | All paths under /list (proxied to RTSPtoWeb) |
+| ANY | `/stop`, `/stop/*` | Stop stream | Token | All paths under /stop (proxied to RTSPtoWeb) |
 
 ### Nginx Internalization
 
@@ -1847,12 +1869,14 @@ The original Django deployment used Nginx to proxy `/stream` and other RTSPtoWeb
 - **No Nginx required** for RTSPtoWeb proxying
 - WebSocket upgrades are handled by the Rust proxy handler
 - Rate limiting should be implemented at infrastructure level (load balancer, Cloudflare, etc.) if needed
+- **Wildcard routes**: All paths under `/stream/*`, `/start/*`, `/list/*`, `/stop/*` are proxied to RTSPtoWeb
 
 The Rust proxy handler (`proxy_to_rtsptoweb` in `src/main.rs`) properly forwards:
 - WebSocket upgrade headers (`Upgrade`, `Connection`)
 - Query parameters (including stream tokens)
 - Request/response bodies
 - All headers except `host`
+- Full URI path (e.g., `/stream/uuid/channel/0/hls/live/index.m3u8`)
 
 **Original Nginx Config** (now internalized):
 ```nginx
