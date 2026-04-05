@@ -216,11 +216,15 @@ async fn main() -> anyhow::Result<()> {
         }))
         .route("/stream", any({
             let url = rtsptoweb_url.clone();
-            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+            move |ws: Option<axum::extract::ws::WebSocketUpgrade>, req: axum::extract::Request| {
+                proxy_to_rtsptoweb_stream(ws, req, url.clone())
+            }
         }))
         .route("/stream/*path", any({
             let url = rtsptoweb_url.clone();
-            move |req: axum::extract::Request| proxy_to_rtsptoweb(req, url.clone())
+            move |ws: Option<axum::extract::ws::WebSocketUpgrade>, req: axum::extract::Request| {
+                proxy_to_rtsptoweb_stream(ws, req, url.clone())
+            }
         }))
         .route("/list", any({
             let url = rtsptoweb_url.clone();
@@ -269,54 +273,33 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reverse proxy handler for rtsptoweb routes.
+/// Reverse proxy handler for rtsptoweb routes with WebSocket support.
 ///
-/// Detects WebSocket upgrade requests and tunnels them bidirectionally.
-/// Regular HTTP requests are proxied normally.
-async fn proxy_to_rtsptoweb(
+/// This handler is used for `/stream/*` routes which need to handle both
+/// regular HTTP requests and WebSocket upgrades for MSE video streaming.
+async fn proxy_to_rtsptoweb_stream(
+    ws: Option<axum::extract::ws::WebSocketUpgrade>,
     req: axum::extract::Request,
     rtsptoweb_base: String,
 ) -> Result<axum::response::Response, crate::error::AppError> {
-    // Check if this is a WebSocket upgrade request
-    let is_websocket = req
-        .headers()
-        .get(axum::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-
-    if is_websocket {
-        // Handle WebSocket upgrade - extract info before consuming request
+    // Check if this is a WebSocket upgrade
+    if let Some(ws_upgrade) = ws {
+        // WebSocket upgrade - extract path/query for upstream connection
         let path = req.uri().path().to_string();
         let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-
-        // Verify this is a valid WebSocket upgrade
-        if !req.headers().contains_key("sec-websocket-key") {
-            tracing::error!(
-                target: "teleicu_gateway::proxy",
-                "❌ WebSocket upgrade missing sec-websocket-key header"
-            );
-            return Err(crate::error::AppError::Internal(
-                anyhow::anyhow!("Invalid WebSocket upgrade request")
-            ));
-        }
-
-        // Extract WebSocket upgrade and tunnel to RTSPtoWeb
-        let ws_upgrade = axum::extract::ws::WebSocketUpgrade::from_request(req, &())
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    target: "teleicu_gateway::proxy",
-                    "❌ Failed to extract WebSocket upgrade: {}",
-                    e
-                );
-                crate::error::AppError::Internal(anyhow::anyhow!("WebSocket extraction failed: {}", e))
-            })?;
 
         return ws_proxy::handle_websocket_proxy(ws_upgrade, path, query, rtsptoweb_base).await;
     }
 
     // Regular HTTP proxy logic below
+    proxy_to_rtsptoweb(req, rtsptoweb_base).await
+}
+
+/// Reverse proxy handler for regular HTTP requests to rtsptoweb.
+async fn proxy_to_rtsptoweb(
+    req: axum::extract::Request,
+    rtsptoweb_base: String,
+) -> Result<axum::response::Response, crate::error::AppError> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!(

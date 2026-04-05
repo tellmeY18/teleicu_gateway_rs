@@ -108,10 +108,10 @@ async fn tunnel_websocket(
                 Ok(msg) => {
                     // Convert axum WebSocket message to tungstenite message
                     let upstream_msg = match msg {
-                        Message::Text(t) => TungsteniteMessage::Text(t),
-                        Message::Binary(b) => TungsteniteMessage::Binary(b),
-                        Message::Ping(p) => TungsteniteMessage::Ping(p),
-                        Message::Pong(p) => TungsteniteMessage::Pong(p),
+                        Message::Text(t) => TungsteniteMessage::Text(t.into()),
+                        Message::Binary(b) => TungsteniteMessage::Binary(b.into()),
+                        Message::Ping(p) => TungsteniteMessage::Ping(p.into()),
+                        Message::Pong(p) => TungsteniteMessage::Pong(p.into()),
                         Message::Close(_) => {
                             tracing::debug!(
                                 target: "teleicu_gateway::proxy",
@@ -158,10 +158,10 @@ async fn tunnel_websocket(
                 Ok(msg) => {
                     // Convert tungstenite message to axum WebSocket message
                     let client_msg = match msg {
-                        TungsteniteMessage::Text(t) => Message::Text(t),
-                        TungsteniteMessage::Binary(b) => Message::Binary(b),
-                        TungsteniteMessage::Ping(p) => Message::Ping(p),
-                        TungsteniteMessage::Pong(p) => Message::Pong(p),
+                        TungsteniteMessage::Text(t) => Message::Text(t.to_string()),
+                        TungsteniteMessage::Binary(b) => Message::Binary(b.to_vec()),
+                        TungsteniteMessage::Ping(p) => Message::Ping(p.to_vec()),
+                        TungsteniteMessage::Pong(p) => Message::Pong(p.to_vec()),
                         TungsteniteMessage::Close(_) => {
                             tracing::debug!(
                                 target: "teleicu_gateway::proxy",
