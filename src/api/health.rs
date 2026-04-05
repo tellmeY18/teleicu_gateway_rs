@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use crate::error::AppError;
 use crate::state::AppState;
 
+// Build timestamp for version tracking
+const BUILD_TIMESTAMP: Option<&str> = option_env!("BUILD_TIMESTAMP");
+
 /// GET /healthz — basic health check
 pub async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // Check database connectivity
@@ -17,7 +20,8 @@ pub async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, AppEr
 
     Ok(Json(json!({
         "server": "ok",
-        "database": db_status
+        "database": db_status,
+        "build_timestamp": BUILD_TIMESTAMP.unwrap_or("unknown")
     })))
 }
 
@@ -39,7 +43,8 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<Value>, AppErr
     Ok(Json(json!({
         "server": "ok",
         "database": db_status,
-        "version": state.settings.app_version
+        "version": state.settings.app_version,
+        "build_timestamp": BUILD_TIMESTAMP.unwrap_or("unknown")
     })))
 }
 

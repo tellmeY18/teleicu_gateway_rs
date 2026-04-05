@@ -27,6 +27,9 @@ use crate::observations::store::ObservationStore;
 use crate::onvif::lock::CameraLockMap;
 use crate::state::AppState;
 
+// Build timestamp for version tracking (set via: BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) cargo build)
+const BUILD_TIMESTAMP: Option<&str> = option_env!("BUILD_TIMESTAMP");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env file (ignore errors if not present)
@@ -58,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
         settings.app_version,
         settings.bind_host,
         settings.bind_port
+    );
+    tracing::info!(
+        "🔨 Build timestamp: {}",
+        BUILD_TIMESTAMP.unwrap_or("not set - rebuild with BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) cargo build")
     );
     tracing::info!("  cwd            = {cwd}");
     tracing::info!("  DATABASE_URL   = {}", settings.database_url);
