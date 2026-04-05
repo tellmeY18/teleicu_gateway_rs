@@ -55,7 +55,7 @@ pub async fn get_presets(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 GET /cameras/presets - hostname: {}, port: {}, user: {}",
+        "📷 GET /presets - hostname: {}, port: {}, user: {}",
         params.hostname,
         params.port,
         params.username
@@ -78,7 +78,7 @@ pub async fn get_presets(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Presets retrieved for {} - count: {}",
+        "✅ GET /presets - Presets retrieved for {} - count: {}",
         params.hostname,
         presets.len()
     );
@@ -94,7 +94,7 @@ pub async fn get_camera_status(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 GET /cameras/status - hostname: {}, port: {}",
+        "📷 GET /status - hostname: {}, port: {}",
         params.hostname,
         params.port
     );
@@ -109,7 +109,7 @@ pub async fn get_camera_status(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Camera status retrieved for {}",
+        "✅ GET /status - Camera status retrieved for {}",
         params.hostname
     );
 
@@ -124,7 +124,7 @@ pub async fn absolute_move(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 POST /cameras/absoluteMove - hostname: {}, x: {}, y: {}, zoom: {}",
+        "📷 POST /absoluteMove - hostname: {}, x: {}, y: {}, zoom: {}",
         req.hostname,
         req.x,
         req.y,
@@ -164,7 +164,7 @@ pub async fn absolute_move(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Absolute move completed for {} to position ({}, {}, {})",
+        "✅ POST /absoluteMove - Completed for {} to position ({}, {}, {})",
         req.hostname,
         req.x,
         req.y,
@@ -182,7 +182,7 @@ pub async fn relative_move(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 POST /cameras/relativeMove - hostname: {}, dx: {}, dy: {}, dzoom: {}",
+        "📷 POST /relativeMove - hostname: {}, dx: {}, dy: {}, dzoom: {}",
         req.hostname,
         req.x,
         req.y,
@@ -222,7 +222,7 @@ pub async fn relative_move(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Relative move completed for {} by delta ({}, {}, {})",
+        "✅ POST /relativeMove - Completed for {} by delta ({}, {}, {})",
         req.hostname,
         req.x,
         req.y,
@@ -240,7 +240,7 @@ pub async fn snapshot_at_location(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 POST /cameras/snapshotAtLocation - hostname: {}, x: {}, y: {}, zoom: {}",
+        "📷 POST /snapshotAtLocation - hostname: {}, x: {}, y: {}, zoom: {}",
         req.hostname,
         req.x,
         req.y,
@@ -282,7 +282,7 @@ pub async fn snapshot_at_location(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Snapshot URI retrieved for {} at position ({}, {}, {}): {}",
+        "✅ POST /snapshotAtLocation - URI retrieved for {} at position ({}, {}, {}): {}",
         req.hostname,
         req.x,
         req.y,
@@ -305,7 +305,7 @@ pub async fn goto_preset(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 POST /cameras/gotoPreset - hostname: {}, preset_index: {}",
+        "📷 POST /gotoPreset - hostname: {}, preset_index: {}",
         req.hostname,
         preset_index
     );
@@ -354,7 +354,7 @@ pub async fn goto_preset(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Camera {} moved to preset #{} ({})",
+        "✅ POST /gotoPreset - Camera {} moved to preset #{} ({})",
         req.hostname,
         preset_index,
         preset.name
@@ -375,7 +375,7 @@ pub async fn set_preset(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "📷 POST /cameras/set_preset - hostname: {}, preset_name: {}",
+        "📷 POST /set_preset - hostname: {}, preset_name: {}",
         req.hostname,
         preset_name
     );
@@ -391,7 +391,7 @@ pub async fn set_preset(
 
     tracing::info!(
         target: "teleicu_gateway::camera",
-        "✅ Preset '{}' saved for camera {}",
+        "✅ POST /set_preset - Preset '{}' saved for camera {}",
         preset_name,
         req.hostname
     );

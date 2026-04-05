@@ -1738,3 +1738,194 @@ This means we do **not** need `openssl` or `openssl.dev` in nixpkgs dependencies
 5. Check pipeline logs on the Tangled pipelines page for the repo.
 6. Tag a test release (`v0.0.1-rc1`), verify the build workflow triggers on the tag.
 7. (Future) Add musl static build workflow once musl cross-compilation is validated in nixery.
+
+---
+
+## Plan 4: Drop-in Replacement for Django Middleware — Camera API Route Fixes
+
+### Goal
+
+Make the Rust gateway a **drop-in replacement** for the original Django middleware by fixing API route mismatches that prevent the Care Django plugin (`care_teleicu_devices`) from successfully controlling cameras.
+
+The existing Django middleware works perfectly with the Care plugin. The Rust implementation must match the **exact API contract** that the Django plugin expects.
+
+### Problem: API Route Path Mismatch
+
+**What Django Plugin Expects** (`care_teleicu_devices/camera_device/viewsets/actions.py`):
+
+```python
+gateway_client.get("/status", request_data, as_http_response=True)
+gateway_client.get("/presets", request_data, as_http_response=True)
+gateway_client.post("/gotoPreset", request_data, as_http_response=True)
+gateway_client.post("/absoluteMove", request_data, as_http_response=True)
+gateway_client.post("/relativeMove", request_data, as_http_response=True)
+gateway_client.post("/getToken/videoFeed", request_data, as_http_response=True)
+```
+
+**What Rust Currently Implements** (`src/main.rs`):
+
+```rust
+.route("/cameras/status", get(api::camera::get_camera_status))
+.route("/cameras/presets", get(api::camera::get_presets))
+.route("/cameras/absoluteMove", post(api::camera::absolute_move))
+.route("/cameras/relativeMove", post(api::camera::relative_move))
+.route("/cameras/gotoPreset", post(api::camera::goto_preset))
+.route("/cameras/set_preset", post(api::camera::set_preset))
+.route("/cameras/snapshotAtLocation", post(api::camera::snapshot_at_location))
+```
+
+**Issue**: Django calls `/status` but Rust expects `/cameras/status`. All camera control endpoints have an extra `/cameras` prefix that breaks the API contract.
+
+### Root Cause
+
+The Rust implementation was built based on `CameraArch.md` documentation but the route structure diverged from what the Django middleware actually implemented. The original Django middleware used routes **without** the `/cameras` prefix, and the Care plugin was built against that contract.
+
+### Solution: Remove `/cameras` Prefix from Camera Routes
+
+Change the Rust route registration to match Django middleware's API contract exactly.
+
+### Changes Required
+
+#### File: `src/main.rs`
+
+**Current Routes**:
+```rust
+.route("/cameras/status", get(api::camera::get_camera_status))
+.route("/cameras/presets", get(api::camera::get_presets))
+.route("/cameras/absoluteMove", post(api::camera::absolute_move))
+.route("/cameras/relativeMove", post(api::camera::relative_move))
+.route("/cameras/gotoPreset", post(api::camera::goto_preset))
+.route("/cameras/set_preset", post(api::camera::set_preset))
+.route("/cameras/snapshotAtLocation", post(api::camera::snapshot_at_location))
+```
+
+**Fixed Routes**:
+```rust
+// Camera control endpoints (match Django middleware API contract)
+.route("/status", get(api::camera::get_camera_status))
+.route("/presets", get(api::camera::get_presets))
+.route("/gotoPreset", post(api::camera::goto_preset))
+.route("/absoluteMove", post(api::camera::absolute_move))
+.route("/relativeMove", post(api::camera::relative_move))
+.route("/set_preset", post(api::camera::set_preset))
+.route("/snapshotAtLocation", post(api::camera::snapshot_at_location))
+
+// Keep the "all cameras status" endpoint with /cameras prefix to avoid conflict
+.route("/cameras/status", get(api::camera::cameras_status_all))
+```
+
+**Note**: The `/cameras/status` route for getting all cameras' status (used by monitoring) is kept separate with the prefix to avoid conflicting with the per-camera `/status` endpoint.
+
+### Expected API Contract After Fix
+
+| Method | Path | Purpose | Auth | Request Params |
+|--------|------|---------|------|----------------|
+| GET | `/status` | Get PTZ status for a camera | Care_Bearer | Query: `hostname`, `port`, `username`, `password` |
+| GET | `/presets` | List presets for a camera | Care_Bearer | Query: `hostname`, `port`, `username`, `password` |
+| POST | `/gotoPreset` | Go to preset by index | Care_Bearer | Body: `{hostname, port, username, password, preset: int}` |
+| POST | `/absoluteMove` | Absolute PTZ move | Care_Bearer | Body: `{hostname, port, username, password, x, y, zoom}` |
+| POST | `/relativeMove` | Relative PTZ move | Care_Bearer | Body: `{hostname, port, username, password, x, y, zoom}` |
+| POST | `/set_preset` | Create new preset | Care_Bearer | Body: `{hostname, port, username, password, preset_name}` |
+| POST | `/snapshotAtLocation` | Move & get snapshot URI | Care_Bearer | Body: `{hostname, port, username, password, x, y, zoom}` |
+| GET | `/cameras/status` | All cameras' status | Care_Bearer | None (returns device statuses from observation store) |
+| POST | `/getToken/videoFeed` | Get stream token | Care_Bearer | Body: `{stream, ip, _duration}` |
+| POST | `/getToken/vitals` | Get vitals token | Care_Bearer | Body: `{asset_id, ip, _duration}` |
+| POST | `/verifyToken` | Verify token | None | Body: `{token, ip?, stream?}` |
+| POST | `/verify_token` | Exchange/verify token | None | Body: `{token}` |
+
+### Testing Checklist
+
+Verify drop-in replacement works:
+
+- [ ] **Camera Status**: `GET /status?hostname=192.168.1.100&port=80&username=admin&password=admin` returns PTZ position
+- [ ] **Presets List**: `GET /presets?hostname=192.168.1.100&port=80&username=admin&password=admin` returns preset map
+- [ ] **Go to Preset**: `POST /gotoPreset` with `{hostname, port, username, password, preset: 0}` moves camera
+- [ ] **Absolute Move**: `POST /absoluteMove` with `{hostname, port, username, password, x: 0.5, y: 0.0, zoom: 0.0}` moves camera
+- [ ] **Relative Move**: `POST /relativeMove` with `{hostname, port, username, password, x: 0.1, y: 0.0, zoom: 0.0}` moves camera
+- [ ] **Set Preset**: `POST /set_preset` with `{hostname, port, username, password, preset_name: "Test"}` creates preset
+- [ ] **Snapshot**: `POST /snapshotAtLocation` with position params returns snapshot URI
+- [ ] **All Cameras**: `GET /cameras/status` returns device status map (unchanged route)
+- [ ] **Stream Token**: `POST /getToken/videoFeed` with `{stream, ip, _duration}` returns JWT
+- [ ] **Django Plugin Integration**: Care UI camera controls work without any Django plugin changes
+
+### Implementation Steps
+
+1. **Update Routes in `src/main.rs`**:
+   - Remove `/cameras` prefix from individual camera control endpoints
+   - Keep `/cameras/status` for the "all cameras" monitoring endpoint
+   - Verify no route conflicts (e.g., `/status` is unique)
+
+2. **Test Locally**:
+   ```bash
+   # Start gateway
+   cargo run
+   
+   # Test camera status endpoint
+   curl "http://localhost:8000/status?hostname=192.168.1.100&port=80&username=admin&password=pass" \
+     -H "Authorization: Bearer <care_jwt_token>"
+   
+   # Test presets endpoint
+   curl "http://localhost:8000/presets?hostname=192.168.1.100&port=80&username=admin&password=pass" \
+     -H "Authorization: Bearer <care_jwt_token>"
+   ```
+
+3. **Verify Django Plugin Compatibility**:
+   - Deploy Rust gateway to test environment
+   - Update Care's gateway device configuration to point to Rust gateway
+   - Test camera controls from Care UI:
+     - View camera status
+     - List presets
+     - Go to preset
+     - Pan/tilt/zoom controls
+     - Create new preset
+   - Verify no errors in Care backend logs
+   - Verify no errors in gateway logs
+
+4. **Deploy as Drop-in Replacement**:
+   - Stop Django middleware
+   - Start Rust gateway on same port (default 8000)
+   - No changes needed to Care configuration or database
+   - Camera controls should work immediately
+
+### Backwards Compatibility Notes
+
+**Breaking Change**: Routes with `/cameras` prefix are **no longer supported** for individual camera operations.
+
+**Migration Path**: None needed — the Django plugin has always used routes without the prefix. This fix makes Rust match the expected contract.
+
+**Affected Routes**:
+- ~~`/cameras/status`~~ → `/status` (per-camera status)
+- ~~`/cameras/presets`~~ → `/presets`
+- ~~`/cameras/absoluteMove`~~ → `/absoluteMove`
+- ~~`/cameras/relativeMove`~~ → `/relativeMove`
+- ~~`/cameras/gotoPreset`~~ → `/gotoPreset`
+
+**Unchanged Routes**:
+- `/cameras/status` (all cameras monitoring endpoint - different from per-camera status)
+- `/getToken/videoFeed`
+- `/health/*`
+- `/update_observations`
+- All WebSocket endpoints
+
+### Additional Notes
+
+1. **Port Configuration**: The Django plugin currently hardcodes `port: 80` in `get_gateway_request_data()`. Most ONVIF cameras use port 554 or 8000. This is a **Django plugin issue**, not a Rust issue. The Rust gateway correctly accepts any port via the API.
+
+2. **Stream Token IP Field**: The Django plugin's `stream_token` action currently passes `metadata["endpoint_address"]` (camera IP) as the `ip` field, but it should pass the **client's IP** for proper access control. This is also a **Django plugin issue**.
+
+3. **Camera Lock Mechanism**: The Rust implementation correctly implements camera locking with timeout. Multiple concurrent move operations will be serialized automatically.
+
+4. **Error Responses**: Match Django middleware error responses:
+   - Invalid credentials → `400 Bad Request` with `InvalidCameraCredentials` error
+   - Camera locked → `409 Conflict` with `CameraLocked` error
+   - ONVIF errors → `500 Internal Server Error` with error message
+
+### Success Criteria
+
+✅ **Drop-in Replacement Achieved When**:
+1. Rust gateway runs on same port as Django middleware
+2. Care Django plugin works without code changes
+3. All camera control operations work from Care UI
+4. Camera locking prevents concurrent operations
+5. Stream tokens are generated correctly
+6. No breaking changes to API contract
