@@ -74,3 +74,5 @@ dashmap        = "5"
 # wire the transport ourselves: `reqwest` supplies the HTTP client and `rustls`
 # switches it to rustls-tls, keeping the entire dep-tree OpenSSL-free.
 sentry         = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "tracing", "reqwest", "rustls"] }
+tokio-tungstenite = "0.29.0"
+futures-util = "0.3.32"

@@ -2067,3 +2067,187 @@ Verify drop-in replacement works:
 4. Camera locking prevents concurrent operations
 5. Stream tokens are generated correctly
 6. No breaking changes to API contract
+
+## Plan 5: Fix Video Stream Stuck on Single Frame — WebSocket Proxy Issue ✅ READY TO IMPLEMENT
+
+### Problem Statement
+
+**Symptom**: Video stream displays only a single frozen frame instead of continuous video playback.
+
+**CARE's Video Streaming**: CARE uses MSE (Media Source Extensions) via WebSocket connection to:
+```
+wss://gateway.10bedicu.in/stream/{stream-uuid}/channel/0/mse?uuid={stream-uuid}
+```
+
+**Root Cause**: The current `proxy_to_rtsptoweb()` function in `src/main.rs` (lines 277-380):
+1. Buffers entire request body into memory
+2. Forwards HTTP request to RTSPtoWeb
+3. Streams HTTP response back to client
+4. **Does NOT handle WebSocket upgrades** - connection dies after HTTP 101 response
+5. No bidirectional frame tunneling, so MSE video frames never reach the client
+
+### Why Current Proxy Fails for WebSocket
+
+```rust
+// Current code reads entire body (line ~289):
+let body_stream = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await
+
+// Then sends as one-time HTTP request (line ~297):
+upstream_req = upstream_req.body(body_stream.to_vec());
+```
+
+**This pattern works for**: HTTP requests (`/start`, `/stop`, `/list`)
+**This pattern fails for**: WebSocket connections (`/stream/.../mse`)
+
+After the initial HTTP 101 Switching Protocols response:
+- ❌ Client sends WebSocket frames → gateway doesn't forward them
+- ❌ RTSPtoWeb sends video frames → gateway doesn't forward them
+- Result: Connection established but frozen (no frame flow)
+
+### Solution: Add WebSocket Tunnel Support
+
+**Strategy**: Detect WebSocket upgrade requests and handle them differently than regular HTTP.
+
+### Simple Action Plan (Step-by-Step)
+
+#### Step 1: Add Dependencies
+```toml
+# Add to Cargo.toml [dependencies]
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+```
+
+**Why**: Need WebSocket client to connect to RTSPtoWeb and tunnel frames bidirectionally.
+
+#### Step 2: Create WebSocket Proxy Module
+
+**File**: `src/ws_proxy.rs` (new file)
+
+**Purpose**: Handle WebSocket-to-WebSocket tunneling separately from HTTP proxy logic.
+
+**What it needs to do**:
+1. Accept incoming WebSocket upgrade from client
+2. Connect to upstream RTSPtoWeb WebSocket
+3. Create two async tasks:
+   - Task A: Forward client frames → upstream
+   - Task B: Forward upstream frames → client
+4. Run until either side closes connection
+
+#### Step 3: Update Main Router
+
+**File**: `src/main.rs`
+
+**Changes needed**:
+1. Add `mod ws_proxy;` at top
+2. Keep existing proxy for `/start`, `/stop`, `/list` (no WebSocket needed)
+3. Replace `/stream/*path` routes to check for WebSocket upgrade:
+   - If `Upgrade: websocket` header present → use `ws_proxy::handle()`
+   - Otherwise → use existing `proxy_to_rtsptoweb()`
+
+**Key insight**: `/stream/*path` handles BOTH:
+- Regular HTTP (e.g., `/stream/list`)
+- WebSocket MSE (e.g., `/stream/{uuid}/channel/0/mse`)
+
+#### Step 4: Detect WebSocket Upgrades
+
+**In route handler**:
+```
+Check headers for:
+- "upgrade" == "websocket"
+- "sec-websocket-key" exists
+
+If both present → WebSocket
+Otherwise → Regular HTTP
+```
+
+#### Step 5: Test MSE Streaming
+
+**Test endpoints**:
+1. `/start` - should still work (HTTP)
+2. `/stop` - should still work (HTTP)
+3. `/list` - should still work (HTTP)
+4. `/stream/{uuid}/channel/0/mse?uuid={uuid}` - should now stream video (WebSocket)
+
+**Verification**:
+- Video shows continuous motion (not frozen)
+- Browser DevTools → Network → WS shows "Connection Established" and ongoing frames
+- No "WebSocket closed unexpectedly" errors
+- RTSPtoWeb logs show successful WebSocket connections
+
+### Implementation Checklist
+
+- [ ] **Step 1**: Add `tokio-tungstenite` and `futures-util` to `Cargo.toml`
+- [ ] **Step 2**: Create `src/ws_proxy.rs` module with WebSocket tunnel logic
+- [ ] **Step 3**: Add `mod ws_proxy;` to `src/main.rs`
+- [ ] **Step 4**: Update `/stream/*path` route to detect WebSocket vs HTTP
+- [ ] **Step 5**: Add logging for WebSocket connections (proxy target)
+- [ ] **Step 6**: Test MSE endpoint with CARE frontend
+- [ ] **Step 7**: Verify `/start`, `/stop`, `/list` still work via HTTP
+- [ ] **Step 8**: Load test with multiple concurrent video streams
+
+### Files to Modify
+
+1. **`Cargo.toml`**: Add 2 dependencies
+2. **`src/ws_proxy.rs`**: Create new (WebSocket tunnel implementation)
+3. **`src/main.rs`**: 
+   - Add module declaration
+   - Update `/stream/*path` route handler (~line 221)
+   - Add import statements
+
+**Estimated Changes**: ~150 lines total (120 new in ws_proxy.rs, 30 modified in main.rs)
+
+### Architecture Decision: Why Separate Module
+
+**Option A** (Chosen): Separate `ws_proxy.rs` module
+- ✅ Clean separation of concerns
+- ✅ Easy to test independently
+- ✅ Existing HTTP proxy unchanged
+- ✅ Clear code organization
+
+**Option B**: Modify `proxy_to_rtsptoweb()` to handle both
+- ❌ Function becomes complex
+- ❌ Mixed HTTP and WebSocket logic
+- ❌ Harder to debug
+
+### Key RTSPtoWeb Endpoints
+
+**HTTP Endpoints** (use existing proxy):
+- `/start` - Start streaming RTSP source
+- `/stop` - Stop streaming
+- `/list` - List active streams
+
+**WebSocket Endpoints** (need new tunnel):
+- `/stream/{uuid}/channel/{ch}/mse` - MSE video stream
+- `/stream/{uuid}/channel/{ch}/webrtc` - WebRTC stream (if used)
+
+### Logging Strategy
+
+Add to `teleicu_gateway::proxy` target:
+- `🎥 WebSocket tunnel opened: /stream/{uuid}/channel/0/mse`
+- `⬆️ Client → RTSPtoWeb: {frame_count} frames`
+- `⬇️ RTSPtoWeb → Client: {frame_count} frames`
+- `✅ WebSocket tunnel closed: duration={duration}s`
+
+### Success Criteria
+
+✅ **Video Streaming Fixed When**:
+1. CARE frontend shows continuous video (not frozen frame)
+2. Browser DevTools shows WebSocket connection stays open
+3. No "WebSocket closed" errors in browser console
+4. RTSPtoWeb logs show successful MSE connections
+5. Multiple concurrent streams work without interference
+6. Existing HTTP endpoints (`/start`, `/stop`, `/list`) still functional
+7. Gateway logs show bidirectional frame forwarding
+8. Video quality matches Django middleware implementation
+
+### Next Steps After Plan Completion
+
+Once working:
+1. Document MSE endpoint behavior in architecture docs
+2. Add metrics for WebSocket tunnel duration
+3. Consider adding reconnection logic for network blips
+4. Add WebSocket tunnel tests to test suite (Plan 1)
+
+
+</text>
+

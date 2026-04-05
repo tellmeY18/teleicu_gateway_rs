@@ -9,6 +9,7 @@ mod onvif;
 mod state;
 mod tasks;
 mod ws;
+mod ws_proxy;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -269,10 +270,53 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Reverse proxy handler for rtsptoweb routes.
+///
+/// Detects WebSocket upgrade requests and tunnels them bidirectionally.
+/// Regular HTTP requests are proxied normally.
 async fn proxy_to_rtsptoweb(
     req: axum::extract::Request,
     rtsptoweb_base: String,
 ) -> Result<axum::response::Response, crate::error::AppError> {
+    // Check if this is a WebSocket upgrade request
+    let is_websocket = req
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_websocket {
+        // Handle WebSocket upgrade - extract info before consuming request
+        let path = req.uri().path().to_string();
+        let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+
+        // Verify this is a valid WebSocket upgrade
+        if !req.headers().contains_key("sec-websocket-key") {
+            tracing::error!(
+                target: "teleicu_gateway::proxy",
+                "❌ WebSocket upgrade missing sec-websocket-key header"
+            );
+            return Err(crate::error::AppError::Internal(
+                anyhow::anyhow!("Invalid WebSocket upgrade request")
+            ));
+        }
+
+        // Extract WebSocket upgrade and tunnel to RTSPtoWeb
+        let ws_upgrade = axum::extract::ws::WebSocketUpgrade::from_request(req, &())
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "teleicu_gateway::proxy",
+                    "❌ Failed to extract WebSocket upgrade: {}",
+                    e
+                );
+                crate::error::AppError::Internal(anyhow::anyhow!("WebSocket extraction failed: {}", e))
+            })?;
+
+        return ws_proxy::handle_websocket_proxy(ws_upgrade, path, query, rtsptoweb_base).await;
+    }
+
+    // Regular HTTP proxy logic below
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!(
